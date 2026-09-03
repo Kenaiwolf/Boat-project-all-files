@@ -42,15 +42,14 @@ end
 -- FS_GCS_ENABLE only filters on sysid (sysid_is_gcs), and the Nano shares  
 -- sysid=1 with the autopilot itself, so it can never be distinguished by  
 -- that mechanism. Decode HEARTBEAT ourselves and key on compid instead.  
-local mavlink_msgs = require("mavlink/mavlink_msgs")  
+-- HEARTBEAT msgid is fixed by the MAVLink spec = 0 (no module file needed)  
 local NANO_COMPID = 191  
 local NANO_TIMEOUT_MS = 5000  
-local HEARTBEAT_ID = mavlink_msgs.get_msgid("HEARTBEAT")  
-local nano_msg_map = {[HEARTBEAT_ID]="HEARTBEAT"}  
+local HEARTBEAT_ID = 0  
 mavlink.init(10, 1)  
 mavlink.register_rx_msgid(HEARTBEAT_ID)  
 local nano_connected=false  
-local last_nano_seen=millis():tofloat()  
+local last_nano_seen=millis():tofloat()
   
 local qry_div=0  
 local last_valid_pkt=millis():tofloat()  
@@ -109,15 +108,17 @@ local function update()
     end    
   end
   
-  -- drain any pending mavlink HEARTBEATs this tick, watch for the Nano (compid=191)  
-  while true do  
-    local msg = mavlink.receive_chan()  
-    if not msg then break end  
-    local parsed = mavlink_msgs.decode(msg, nano_msg_map)  
-    if parsed and parsed.compid==NANO_COMPID then  
-      nano_connected=true  
-      last_nano_seen=now  
-    end  
+  -- drain any pending mavlink HEARTBEATs this tick, watch for the Nano (compid=191)    
+  -- compid lives at byte 9 of the raw message buffer (seq,sysid,compid = bytes 7,8,9) --  
+  -- see mavlink_msgs.decode_header() - no per-message module file required for this    
+  while true do    
+    local msg = mavlink.receive_chan()    
+    if not msg then break end    
+    local compid = msg:byte(9)    
+    if compid==NANO_COMPID then    
+      nano_connected=true    
+      last_nano_seen=now    
+    end    
   end  
   
   qry_div=qry_div+1  
