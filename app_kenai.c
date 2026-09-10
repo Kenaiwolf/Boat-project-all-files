@@ -285,10 +285,11 @@ void app_custom_start(void) {
     last_cmd_time = chVTGetSystemTimeX();
     cmd_received_ever = false;
 
-    stop_now = false;
-    control_is_running = true;   // set BEFORE thread starts to avoid race in app_custom_stop
-    chThdCreateStatic(control_thread_wa, sizeof(control_thread_wa),
-            NORMALPRIO, control_thread, NULL);
+    stop_now = false;  
+    control_is_running = true;   // set BEFORE thread starts to avoid race in app_custom_stop  
+    timeout_configure_app_monitor(true);  // require this app's thread to check in, or IWDG resets MCU  
+    chThdCreateStatic(control_thread_wa, sizeof(control_thread_wa),  
+            NORMALPRIO, control_thread, NULL);  
 	}
 
 // ============================================================
@@ -303,10 +304,11 @@ void app_custom_stop(void) {
     terminal_unregister_callback(terminal_kenai_stop);
     terminal_unregister_callback(terminal_kenai_set_stops);
 
-    stop_now = true;
-    while (control_is_running) {
-        chThdSleepMilliseconds(1);
-    }
+    stop_now = true;  
+    while (control_is_running) {  
+        chThdSleepMilliseconds(1);  
+    }  
+    timeout_configure_app_monitor(false);  // stop requiring THREAD_APP check-ins once stopped  
 }
 
 // ============================================================
@@ -394,12 +396,14 @@ static THD_FUNCTION(control_thread, arg) {
 
     systime_t time_last = chVTGetSystemTimeX();
 
-    for (;;) {
-        if (stop_now) {
-            control_is_running = false;
-            return;
-        }
-
+    for (;;) {  
+        if (stop_now) {  
+            control_is_running = false;  
+            return;  
+        }  
+  
+        timeout_feed_WDT(THREAD_APP);  // confirm this loop iteration is alive to the IWDG watchdog  
+  
         float dt = (float)ST2MS(chVTTimeElapsedSinceX(time_last)) / 1000.0f;
         time_last = chVTGetSystemTimeX();
 
