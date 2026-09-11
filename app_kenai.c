@@ -43,7 +43,7 @@
 
 // Safety margin: clamped_target stays this many deg short of a hard stop so PID
 // error can reach zero before contact — else output holds near-max current forever.
-#define STOP_APPROACH_MARGIN_DEG 1.0f
+#define STOP_APPROACH_MARGIN_DEG 0.1f
 
 // Homing result below this span => invalid (e.g. hall disconnected/frozen encoder).
 #define MIN_VALID_SPAN_DEG 10.0f
@@ -494,11 +494,12 @@ static THD_FUNCTION(control_thread, arg) {
         // Consumed by ACTIVE's clamp below AND by MSG_SET_ANGLE's UART scaling in
         // process_custom_app_data() (a different thread) via the shared volatile sym_limit_deg,
         // so the two can never disagree/drift even if this formula changes later.
-        {
-            float half_range_calc = range_limit / 2.0f;
-            float sym_limit_calc  = half_range_calc - fabsf(center_trim_deg) - STOP_APPROACH_MARGIN_DEG;
-            if (sym_limit_calc < 0.0f) sym_limit_calc = 0.0f; // guard: trim >= half_range (degenerate config)
-            sym_limit_deg = sym_limit_calc;
+        {  
+            float half_range_calc = range_limit / 2.0f;  
+            float sym_limit_calc  = half_range_calc - fabsf(center_trim_deg) - STOP_APPROACH_MARGIN_DEG;  
+            if (sym_limit_calc < 0.0f) sym_limit_calc = 0.0f; // guard: trim >= half_range (degenerate config)  
+            if (sym_limit_calc > 93.0f) sym_limit_calc = 93.0f; // hard cap — never command more than ±93 deg from trimmed center, regardless of mechanical span  
+            sym_limit_deg = sym_limit_calc;  
         }
 
         // --------------------------------------------------------
@@ -843,11 +844,16 @@ static THD_FUNCTION(control_thread, arg) {
                     // Gains reuse p_pid_kp / p_pid_ki / p_pid_kd from mcconf.
                     float p_term = error * mcconf->p_pid_kp;
 
-                    active_i_term += error * mcconf->p_pid_ki * dt;
-                    {
-                        float p_tmp = p_term;
-                        utils_truncate_number_abs(&p_tmp, 1.0f);
-                        utils_truncate_number_abs(&active_i_term, 1.0f - fabsf(p_tmp));
+                    {  
+                        float i_candidate = active_i_term + error * mcconf->p_pid_ki * dt;  
+  
+                        // Only accept the new integration step if it doesn't push total output  
+                        // deeper into saturation; otherwise freeze (keep old active_i_term).  
+                        float provisional_output = p_term + i_candidate + active_d_filter;  
+                        if (fabsf(provisional_output) < 1.0f || (provisional_output * error) < 0.0f) {  
+                            active_i_term = i_candidate;  
+                        }  
+                        utils_truncate_number(&active_i_term, -1.0f, 1.0f); // still keep a hard ceiling as a safety backstop  
                     }
 
                     float d_raw = 0.0f;
@@ -857,9 +863,10 @@ static THD_FUNCTION(control_thread, arg) {
                     }
                     UTILS_LP_FAST(active_d_filter, d_raw, mcconf->p_pid_kd_filter);
 
-                    float output = p_term + active_i_term + active_d_filter;
-                    utils_truncate_number(&output, -1.0f, 1.0f);
-                    mc_interface_set_current(output * mcconf->lo_current_max);
+                    float output = p_term + active_i_term + active_d_filter;  
+                    utils_truncate_number(&output, -1.0f, 1.0f);  
+                    float _out_lim = (output >= 0.0f) ? mcconf->lo_current_max : fabsf(mcconf->lo_current_min);  
+                    mc_interface_set_current(output * _out_lim);
                 }
 
                 // No-hall runaway guard: high current + large persistent error + frozen encoder
@@ -930,23 +937,30 @@ static THD_FUNCTION(control_thread, arg) {
                     active_d_filter   = 0.0f;
                     mc_interface_release_motor();  // storage reached — release motor, rely on mechanical lock
                 } else {
-                    // Same custom PID as ACTIVE — reuses active_* PID state variables
-                    float p_term = stow_err * mcconf->p_pid_kp;
-                    active_i_term += stow_err * mcconf->p_pid_ki * dt;
-                    {
-                        float p_tmp = p_term;
-                        utils_truncate_number_abs(&p_tmp, 1.0f);
-                        utils_truncate_number_abs(&active_i_term, 1.0f - fabsf(p_tmp));
+                    // Same custom PID as ACTIVE — reuses active_* PID state variables  
+                    float p_term = stow_err * mcconf->p_pid_kp;  
+                    {  
+                        float i_candidate = active_i_term + stow_err * mcconf->p_pid_ki * dt;  
+  
+                        // Only accept the new integration step if it doesn't push total output  
+                        // deeper into saturation; otherwise freeze (keep old active_i_term).  
+                        float provisional_output = p_term + i_candidate + active_d_filter;  
+                        if (fabsf(provisional_output) < 1.0f || (provisional_output * stow_err) < 0.0f) {  
+                            active_i_term = i_candidate;  
+                        }  
+                        utils_truncate_number(&active_i_term, -1.0f, 1.0f); // still keep a hard ceiling as a safety backstop  
                     }
+
                         float d_raw = 0.0f;
                         if (dt > 1e-6f) {
                             float pos_change_s = utils_angle_difference(pos_now_rel_s, active_prev_pos);
                             d_raw = -pos_change_s * mcconf->p_pid_kd / dt;
                         }
                     UTILS_LP_FAST(active_d_filter, d_raw, mcconf->p_pid_kd_filter);
-                    float output = p_term + active_i_term + active_d_filter;
-                    utils_truncate_number(&output, -1.0f, 1.0f);
-                    mc_interface_set_current(output * mcconf->lo_current_max);
+                    float output = p_term + active_i_term + active_d_filter;  
+                    utils_truncate_number(&output, -1.0f, 1.0f);  
+                    float _out_lim = (output >= 0.0f) ? mcconf->lo_current_max : fabsf(mcconf->lo_current_min);  
+                    mc_interface_set_current(output * _out_lim);  
                     active_prev_error = stow_err;
                     active_prev_pos   = pos_now_rel_s;
                     timeout_reset();
