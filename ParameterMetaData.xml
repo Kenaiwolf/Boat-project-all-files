@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="utf-8"?>  
+<Params>  
+  <ArduRover>   
+    <MOT_VEC_DEADBAND>  
+      <DisplayName>Vectored thrust deadband</DisplayName>  
+      <Description>Commanded steering/throttle magnitude below which the vectored angle is frozen (anti-jitter near zero throttle)</Description>  
+      <Range>0.0 0.2</Range>  
+      <User>Advanced</User>  
+    </MOT_VEC_DEADBAND>  
+    <MOT_VEC_BLND_THR>  
+      <DisplayName>Vectored thrust blend throttle</DisplayName>  
+      <Description>Filtered throttle below which the vectored angle blends from direct steering-proportional angle into full atan(); 0 = legacy atan() always</Description>  
+      <Range>0.0 1.0</Range>  
+      <User>Advanced</User>  
+    </MOT_VEC_BLND_THR>  
+    <MOT_VEC_RESID_TC>  
+      <DisplayName>Vectored thrust throttle filter time constant</DisplayName>  
+      <Description>Time constant of the low-pass filter applied to throttle before it selects/blends the vectored-thrust regime</Description>  
+      <Units>s</Units>  
+      <Range>0.0 5.0</Range>  
+      <User>Advanced</User>  
+    </MOT_VEC_RESID_TC>  
+    <MOT_DRIFT_G_LOIT>  
+      <DisplayName>Loiter-sourced drift compensation gain</DisplayName>  
+      <Description>Gain applied to Loiter-sourced drift samples at write-time. 0 disables this source, 1 = full, 2 = double compensation</Description>  
+      <Range>0.0 2.0</Range>  
+      <User>Advanced</User>  
+    </MOT_DRIFT_G_LOIT>  
+    <MOT_DRIFT_G_NAV>  
+      <DisplayName>Nav-sourced drift compensation gain</DisplayName>  
+      <Description>Gain applied to nav-mode (Auto/Guided/RTL) drift samples at write-time. 0 disables this source, 1 = full, 2 = double compensation</Description>  
+      <Range>0.0 2.0</Range>  
+      <User>Advanced</User>  
+    </MOT_DRIFT_G_NAV>  
+    <MOT_DRIFT_MAXAGE>  
+      <DisplayName>Drift estimate maximum age</DisplayName>  
+      <Description>Staleness cutoff (s) shared by both drift sources. If no estimate was updated within this time, correction expires (safety for dead estimators / long manual). 0 = never trust any estimate</Description>  
+      <Units>s</Units>  
+      <Range>0 3600</Range>  
+      <User>Advanced</User>  
+    </MOT_DRIFT_MAXAGE>  
+    <MOT_SFL_DB>  
+      <DisplayName>Steering-floor deadband</DisplayName>  
+      <Description>Heading error (deg) below which the vectored-thrust steering-to-throttle floor injects no throttle</Description>  
+      <Units>deg</Units>  
+      <Range>0 45</Range>  
+      <User>Advanced</User>  
+    </MOT_SFL_DB>  
+    <MOT_SFL_GAIN>  
+      <DisplayName>Steering-floor gain</DisplayName>  
+      <Description>Floor throttle percent per degree of heading error above the deadband [%/deg]</Description>  
+      <Range>0 5</Range>  
+      <User>Advanced</User>  
+    </MOT_SFL_GAIN>  
+    <MOT_SFL_MAX>  
+      <DisplayName>Steering-floor maximum</DisplayName>  
+      <Description>Maximum throttle percent the steering-floor is allowed to inject</Description>  
+      <Units>%</Units>  
+      <Range>0 50</Range>  
+      <User>Advanced</User>  
+    </MOT_SFL_MAX>  
+    <MOT_SFL_IFRZ>  
+      <DisplayName>Steering-floor I-term freeze threshold</DisplayName>  
+      <Description>Heading error (deg) above which the speed PID integrator is frozen to prevent windup while rotating in place</Description>  
+      <Units>deg</Units>  
+      <Range>10 90</Range>  
+      <User>Advanced</User>  
+    </MOT_SFL_IFRZ>  
+    <MOT_LOIT_DRF_MIN>  
+      <DisplayName>Loiter drift minimum magnitude</DisplayName>  
+      <Description>Drift estimate (m/s) below which the loiter anti-drift heading is not activated; deadband against GPS/estimate noise</Description>  
+      <Units>m/s</Units>  
+      <Range>0 0.5</Range>  
+      <User>Advanced</User>  
+    </MOT_LOIT_DRF_MIN>  
+    <MOT_LOIT_CST_THR>  
+      <DisplayName>Loiter coasting throttle threshold</DisplayName>  
+      <Description>Pre-floor navigation throttle demand (%) below which the vehicle is considered coasting for method-1 drift sampling</Description>  
+      <Units>%</Units>  
+      <Range>0 10</Range>  
+      <User>Advanced</User>  
+    </MOT_LOIT_CST_THR>  
+    <MOT_LOIT_I_EQERR>  
+      <DisplayName>Loiter drift method-2 equilibrium error</DisplayName>  
+      <Description>Speed-PID error (m/s) below which the I-term is considered at drift equilibrium during the decel-to-stop window</Description>  
+      <Units>m/s</Units>  
+      <Range>0 0.5</Range>  
+      <User>Advanced</User>  
+    </MOT_LOIT_I_EQERR>  
+    <MOT_LOIT_I_MIN>  
+      <DisplayName>Loiter drift method-2 minimum I-term</DisplayName>  
+      <Description>Minimum speed-PID I-term magnitude (0-1 throttle fraction) accepted as a valid drift sample; below this there is nothing to compensate</Description>  
+      <Range>0 0.5</Range>  
+      <User>Advanced</User>  
+    </MOT_LOIT_I_MIN>  
+    <MOT_LOIT_I_ALPHA>  
+      <DisplayName>Loiter drift method-2 EMA alpha</DisplayName>  
+      <Description>EMA weight applied to each I-term sample during the equilibrium window; lower = smoother but slower</Description>  
+      <Range>0.01 1.0</Range>  
+      <User>Advanced</User>  
+    </MOT_LOIT_I_ALPHA>  
+    <MOT_LOIT_I_DISAG>  
+      <DisplayName>Loiter drift method-2 disagreement gate</DisplayName>  
+      <Description>If a new estimate differs from the stored one by more than this fraction of its magnitude, blend only 25% of the way (NAV-style trend check)</Description>  
+      <Range>0.1 2.0</Range>  
+      <User>Advanced</User>  
+    </MOT_LOIT_I_DISAG>  
+    <MOT_LOIT_ROT_ANG>  
+      <DisplayName>Loiter drift method-1 rotation angle gate</DisplayName>  
+      <Description>Vectored-thruster deflection (deg) above which coast drift sampling is blocked. Rotating the hull about its pivot point produces real lateral IMU velocity (v = yaw_rate * pivot_radius) that would be misread as drift. 0 disables the gate</Description>  
+      <Units>deg</Units>  
+      <Range>0 90</Range>  
+      <User>Advanced</User>  
+    </MOT_LOIT_ROT_ANG>  
+    <MOT_LOIT_ROT_RAT>  
+      <DisplayName>Loiter drift method-1 yaw rate gate</DisplayName>  
+      <Description>Yaw rate (deg/s) above which coast drift sampling is blocked. During rotation the IMU orbits the pivot point (~0.6m) - e.g. 45deg/s = ~0.5m/s false drift. 0 disables the gate</Description>  
+      <Units>deg/s</Units>  
+      <Range>0 90</Range>  
+      <User>Advanced</User>  
+    </MOT_LOIT_ROT_RAT>  
+    <MOT_DRIFT_EST_YR>  
+      <DisplayName>Nav drift estimator yaw rate gate</DisplayName>  
+      <Description>Yaw rate (deg/s) above which the shared drift-estimator window (navigate_to_waypoint/Guided) is invalidated. Keep tighter than LOIT_ROT_RAT - the estimator needs long clean windows, not sample count</Description>  
+      <Units>deg/s</Units>  
+      <Range>0 45</Range>  
+      <User>Advanced</User>  
+    </MOT_DRIFT_EST_YR>  
+    <ATC_SPD_EXPO>  
+      <DisplayName>Speed to throttle curve exponent</DisplayName>  
+      <Description>Exponent applied to the normalised speed/cruise_speed ratio when calculating feed-forward throttle. 1.0 gives the original linear behaviour. Values above 1.0 make the curve concave, appropriate for boats where drag increases faster than linearly with speed.</Description>  
+      <Range>1.0 3.0</Range>  
+      <Increment>0.1</Increment>  
+      <User>Advanced</User>  
+    </ATC_SPD_EXPO>  
+    <ATC_STR_DEC_MAX>  
+      <DisplayName>Steering control angular deceleration maximum</DisplayName>  
+      <Description>Steering control angular deceleration maximum (in deg/s/s). 0 to disable deceleration limiting</Description>  
+      <Units>deg/s/s</Units>  
+      <Range>0 1000</Range>  
+      <Increment>0.1</Increment>  
+      <User>Standard</User>  
+    </ATC_STR_DEC_MAX>  
+  </ArduRover>   
+</Params>
