@@ -2,15 +2,19 @@
 // na flesh arduina nano pripojeneho k pixhawk je notne nastavit na pixhawk serial port na -1 co je vypnuty!
 
 // ---- Includes & MAVLink Buffer Setup ----
+// Buffer configurations for AltSoftSerial to handle incoming NMEA sentences properly without overflow
 #define SERIAL_TX_BUFFER_SIZE 128
 #define SERIAL_RX_BUFFER_SIZE 128
 #include <AltSoftSerial.h>
+
+// MAVLink configuration macros to strip signatures and minimize memory footprint on AVR
 #define MAVLINK_NO_SIGN_PACKET
 #define MAVLINK_NO_SIGNATURE_CHECK
 #define MAVLINK_COMM_NUM_BUFFERS 1
 #define MAVLINK_MAX_PAYLOAD_LEN 54
 #define MAVLINK_GET_CHANNEL_BUFFER 1
 #define MAVLINK_GET_CHANNEL_STATUS 1
+// Custom CRC extra table to match specific MAVLink message definitions used in this implementation
 #define MAVLINK_MESSAGE_CRCS {\
   {0, 50, 9, 9, 0, 0, 0}, \
   {11, 89, 6, 6, 1, 4, 0}, \
@@ -22,10 +26,12 @@
   {253, 83, 51, 54, 0, 0, 0}}
 #include <mavlink_types.h>
 
+// Global MAVLink message structures for transmission and reception buffering
 static mavlink_message_t mavMsgTx;
 static mavlink_message_t mavChanBufRx;
 static mavlink_status_t mavRxStatus;
 
+// MAVLink override functions to point the library to our local buffer instances
 mavlink_message_t* mavlink_get_channel_buffer(uint8_t chan) {
     (void)chan;
     return &mavChanBufRx;
@@ -39,39 +45,54 @@ mavlink_status_t* mavlink_get_channel_status(uint8_t chan) {
 #include <mavlink.h>
 #include <avr/wdt.h>
 #include <EEPROM.h>
+// AltSoftSerial instance used for reading incoming NMEA data from the Fishfinder
 AltSoftSerial nmeaSerial;
 static mavlink_message_t mavMsg;
 
 // ---- Config Constants ----
+// Hardware serial baud rate for Pixhawk MAVLink communication
 #define MAV_BAUD 57600UL
+// Software serial baud rate for Fishfinder NMEA communication (e.g., HELIX models)
 #define NMEA_BAUD 38400UL // HELIX
+// MAVLink system and component IDs for addressing the flight controller
 #define TARGET_SYS 1
 #define TARGET_COMP 1
+// MAVLink system and component IDs identifying this Arduino onboard controller
 #define SYS_ID 1
 #define COMP_ID 191
+
+// ArduRover mode enumerations
 #define ROVER_MODE_HOLD 4
 #define ROVER_MODE_LOITER 5
 #define ROVER_MODE_GUIDED 15
+
+// Speed limits and adjustment steps in meters per second
 #define MAX_SPEED_MS 3.5f
 #define MIN_SPEED_MS 0.1f
 #define SPEED_STEP_MS 0.06f
 #define SPEED_DEADBAND_US 200
 #define SPEED_TRIM_CHANNEL 2
 
+// MAVLink target configuration mask for ignoring specific axes in setpoint commands
 #define TYPE_MASK ((uint16_t)((1<<3)|(1<<4)|(1<<5)|(1<<6)|(1<<7)|(1<<8)|(1<<10)|(1<<11)))
 #define COORD_FRAME MAV_FRAME_GLOBAL_INT
+
+// Timer intervals for sending data (in milliseconds)
 #define HB_INTERVAL_MS 1000UL
 #define SEND_INTERVAL_MS 1000UL
+// Timeouts for declaring NMEA data stale
 #define RMB_TIMEOUT_MS 3000UL // can be lowered for helix dont change for 598ci HD
 #define VTG_TIMEOUT_MS 3000UL
 #define DPT_TIMEOUT_MS 3000UL
 
+// Glitch filter for Depth (DPT) data to reject sudden anomalous sonar readings
 #define ENABLE_DPT_GLITCH_FILTER 1
 #if ENABLE_DPT_GLITCH_FILTER
 #define DPT_GLITCH_M 0.6f
 #define DPT_GLITCH_NUM_SAMPLES 3
 #endif
 
+// Contour following tuning parameters
 #define CONTOUR_CIRCLE_RADIUS_M 3.0f
 #define CONTOUR_MIN_TURN_RADIUS_M 1.0f
 #define CONTOUR_CORRECT_DEPTH_M 0.15f
@@ -83,16 +104,23 @@ static mavlink_message_t mavMsg;
 #define CONTOUR_LOST_TIMEOUT_MS 50000UL
 #define CONTOUR_FLIP_GATE_MS 3000UL
 #define CONTOUR_LOST_DIST_M (CONTOUR_CIRCLE_RADIUS_M * 4)
+
+// Operational delays and global scaling factors
 #define LOITER_RESET_MS 1500UL
 #define DEFAULT_SPEED_MS 3.4f
+// Conversion factors between degrees and meters for coordinate math
 #define METERS_PER_DEG_LAT 111111.0f
 #define METERS_PER_INT7_LAT (METERS_PER_DEG_LAT * 1e-7f)
 #define INT7_PER_METER_LAT (1.0f / METERS_PER_INT7_LAT)
+
+// Circular surveying and trajectory correction gains
 #define CIRCLE_RADIUS_GAIN 5.0f
 #define CIRCLE_RADIUS_MAX_CORR_DEG 45.0f
 #define TREND_NUDGE_GAIN 5.0f
 #define TREND_NUDGE_MAX_DEG 25.0f
 #define TREND_DEPTH_MIN_M 0.05f
+
+// Speed command thresholds and resend delays
 #define SPEED_RESEND_THRESHOLD_MS 0.005f
 #define SPEED_KEEPALIVE_MS 5000UL
 #define MODE_SYNC_RESEND_MS 2000UL
@@ -102,6 +130,7 @@ static mavlink_message_t mavMsg;
 #define DEPTH_SLOPE_CONF_THR 0.01f
 
 // ---- EEPROM Address Map & Breadcrumb Codes ----
+// Memory addresses for non-volatile storage of speeds, RAM limits, and crash diagnostics
 #define EEPROM_MAGIC 0xAB13
 #define EEPROM_ADDR_MAGIC 0
 #define EEPROM_ADDR_TRAVEL_SPEED 2
@@ -113,6 +142,7 @@ static mavlink_message_t mavMsg;
 #define SESSION_OK_MAGIC 0xA5
 #define EEPROM_WRITE_DELAY_MS 3000UL
 
+// State tracking codes saved to EEPROM for debugging crash loops
 #define BC_BOOT 0
 #define BC_ENTER_CONTOUR_FOLLOW 1
 #define BC_REENTER_LAST_GOOD 2
@@ -134,6 +164,7 @@ static mavlink_message_t mavMsg;
 #define BC_FOLLOW_LOOP_TOP 18
 
 // ---- Debug Flags ----
+// Feature flags to enable or disable MAVLink status text debugging
 #define DEBUG_RMB_PARSE 1
 #define DEBUG_GUIDED 1
 #define DEBUG_APPROACH 1
@@ -141,7 +172,7 @@ static mavlink_message_t mavMsg;
 #define DEBUG_FOLLOW 1
 #define DEBUG_CONTOUR_TUNING 0
 #define DEBUG_SPEED_TRIM 1
-#define DEBUG_FREE_RAM 0  
+#define DEBUG_FREE_RAM 0
 #define DEBUG_BREADCRUMB 0   // gates all EEPROM breadcrumb writes (EEPROM wear mitigation) — enable only when diagnosing a crash
 #define DEBUG_LINK 0
 #define DEBUG_NO_VESC 0
@@ -151,11 +182,13 @@ static mavlink_message_t mavMsg;
 extern int __heap_start, *__brkval;
 static void sendStatusText(uint8_t severity, const char* text);
 static void sendStatusText_P(uint8_t severity, const char* text);
+// Calculates dynamic free RAM during runtime
 static int freeRam() {
     int v;
     return (int)&v - (__brkval == 0 ? (int)&__heap_start : (int)__brkval);
 }
 static int16_t minFreeRamSeen = 32767;
+// Checks available RAM and stores the lowest value encountered to EEPROM
 static void checkFreeRam(char tag) {
     int r = freeRam();
     if ((int16_t)r < minFreeRamSeen) {
@@ -169,8 +202,11 @@ static void checkFreeRam(char tag) {
 #endif
 
 // ---- Global State Variables ----
+// Defines the primary high-level navigation states of the system
 enum class NavState : uint8_t { GUIDED, LOITER_WP_RESET, CONTOUR_FOLLOW };
+// Defines the sub-states used while executing contour following
 enum class ContourPhase : uint8_t { CIRCLE_APPROACH, CIRCLE_SURVEY, FOLLOW };
+// Identifies which speed profile is currently active
 enum class SpeedSlot : int8_t { NONE = -1, TRAVEL = 0, FISHING = 1 };
 
 static uint16_t resetCount = 0;              // Total processor restarts
@@ -312,6 +348,7 @@ static char nmeaBuf[84];
 static uint8_t nmeaIdx = 0;
 static uint8_t mavBuf[70];
 
+// Safely parses floats from NMEA comma-separated fields
 static float parseFloat(const char* s) {
     if (!s || !*s) return 0.0f;
     float res = 0.0f, fact = 1.0f;
@@ -332,6 +369,7 @@ static float parseFloat(const char* s) {
     return neg ? -res : res;
 }
 
+// Validates the XOR checksum appended to standard NMEA strings
 static bool nmeaChecksumValid(const char* s) {
     if (*s != '$') return false;
     uint8_t cs = 0;
@@ -348,6 +386,7 @@ static bool nmeaChecksumValid(const char* s) {
     return cs == ((h << 4) | l);
 }
 
+// Tokenizes the NMEA string by replacing commas with null terminators
 static uint8_t splitFields(char* buf, char* fields[], uint8_t maxFields) {
     uint8_t n = 0;
     char* p = buf + 1;
@@ -366,6 +405,7 @@ static uint8_t splitFields(char* buf, char* fields[], uint8_t maxFields) {
     return n;
 }
 
+// Converts NMEA DDMM.MMMMM coordinate format into 1e7 scaled integer degrees
 static int32_t parseDDMM(const char* s, char hemi) {
     if (!s || !*s) return 0;
     const char* dot = strchr(s, '.');
@@ -396,9 +436,10 @@ static int32_t parseDDMM(const char* s, char hemi) {
 }
 
 // ---- NMEA Sentence Handlers ----
+// Parses NMEA RMB (Recommended Minimum Navigation Information) for active route tracking
 static void handleRMB(char* fields[], uint8_t n) {
     if (n < 14) return;
-    if (fields[1][0] != 'A') { return; }
+    if (fields[1][0] != 'A') { return; } // Requires status to be Active
 
     int32_t lat = parseDDMM(fields[6], fields[7][0]);
     int32_t lon = parseDDMM(fields[8], fields[9][0]);
@@ -414,6 +455,7 @@ static void handleRMB(char* fields[], uint8_t n) {
     checkFreeRam('R');
 #endif
 
+    // Determine if the destination waypoint ID has changed
     bool destChanged = (strncmp(fields[5], prevDestWpId, sizeof(prevDestWpId) - 1) != 0);
     bool isOriginStart = (strncasecmp(fields[4], "START", 5) == 0);
 
@@ -440,6 +482,7 @@ static void handleRMB(char* fields[], uint8_t n) {
         contourTrigger = false;
     }
 
+    // Check the Arrival flag field
     if (fields[13][0] == 'A') {
         rmbArrived = true;
         if (routeIsMultiWP && !followTriggeredForDest && rmbSeenNotArrivedForDest) {
@@ -455,26 +498,27 @@ static void handleRMB(char* fields[], uint8_t n) {
     rmbEverActive = true;
     lastRMBms = millis();
 
-#if DEBUG_RMB_PARSE  
-    {  
-        static uint8_t lastArr = 255, lastTrg = 255, lastDC = 255;  
-        if (destChanged != lastDC || rmbArrived != lastArr || contourTrigger != lastTrg) {  
-            lastDC = destChanged; lastArr = rmbArrived; lastTrg = contourTrigger;  
-            char dbg[64];  
-            snprintf_P(dbg, sizeof(dbg),  
-                PSTR("RMB dC=%d arr=%d mWP=%d trg=%d slot=%d id=%s"),  
-                (int)destChanged, (int)rmbArrived, (int)routeIsMultiWP,  
-                (int)contourTrigger,  
-                (int)(int8_t)activeSpeedSlot, prevDestWpId);  
-            sendStatusText(MAV_SEVERITY_DEBUG, dbg);  
-        }  
-    }  
+#if DEBUG_RMB_PARSE
+    {
+        static uint8_t lastArr = 255, lastTrg = 255, lastDC = 255;
+        if (destChanged != lastDC || rmbArrived != lastArr || contourTrigger != lastTrg) {
+            lastDC = destChanged; lastArr = rmbArrived; lastTrg = contourTrigger;
+            char dbg[64];
+            snprintf_P(dbg, sizeof(dbg),
+                PSTR("RMB dC=%d arr=%d mWP=%d trg=%d slot=%d id=%s"),
+                (int)destChanged, (int)rmbArrived, (int)routeIsMultiWP,
+                (int)contourTrigger,
+                (int)(int8_t)activeSpeedSlot, prevDestWpId);
+            sendStatusText(MAV_SEVERITY_DEBUG, dbg);
+        }
+    }
 #endif
 }
 
+// Parses NMEA VTG (Course Over Ground and Ground Speed)
 static void handleVTG(char* fields[], uint8_t n) {
     if (n < 6 || !fields[5][0]) return;
-    if (n >= 10 && fields[9][0] == 'N') return;
+    if (n >= 10 && fields[9][0] == 'N') return; // Reject if indicator is 'N' (Data not valid)
     if (!isdigit((uint8_t)fields[5][0]) && fields[5][0] != '.') return;
 
     haveVTG = true;
@@ -488,6 +532,7 @@ static void handleVTG(char* fields[], uint8_t n) {
     }
 }
 
+// Parses NMEA DPT (Depth) outputted by the sonar
 static void handleDPT(char* fields[], uint8_t n) {
     if (n < 2 || !fields[1][0]) return;
     float d = parseFloat(fields[1]);
@@ -495,6 +540,7 @@ static void handleDPT(char* fields[], uint8_t n) {
 
     bool accept = true;
 #if ENABLE_DPT_GLITCH_FILTER
+    // Glitch detection logic requires consecutive anomalous readings to accept a massive change in depth
     float glitch = d - depth_m;
     if (glitch >= DPT_GLITCH_M) {
         if (dptGlitchCount < 0) dptGlitchCount = 0;
@@ -509,16 +555,16 @@ static void handleDPT(char* fields[], uint8_t n) {
     } else {
         dptGlitchCount = 0;
     }
-#if DEBUG_CONTOUR_TUNING  
-    {  
-        char dbg[48];  
-        char dRaw[8], dGl[8];  
-        dtostrf(d, 6, 2, dRaw);  
-        dtostrf(glitch, 6, 2, dGl);  
-        snprintf_P(dbg, sizeof(dbg), PSTR("DPT raw=%s gl=%s cnt=%d acc=%d"),  
-                 dRaw, dGl, (int)dptGlitchCount, (int)accept);  
-        sendStatusText(MAV_SEVERITY_DEBUG, dbg);  
-    }  
+#if DEBUG_CONTOUR_TUNING
+    {
+        char dbg[48];
+        char dRaw[8], dGl[8];
+        dtostrf(d, 6, 2, dRaw);
+        dtostrf(glitch, 6, 2, dGl);
+        snprintf_P(dbg, sizeof(dbg), PSTR("DPT raw=%s gl=%s cnt=%d acc=%d"),
+                 dRaw, dGl, (int)dptGlitchCount, (int)accept);
+        sendStatusText(MAV_SEVERITY_DEBUG, dbg);
+    }
 #endif
 #endif
 
@@ -527,6 +573,7 @@ static void handleDPT(char* fields[], uint8_t n) {
 
     if (accept) {
         depth_m = d;
+        // Calculate Exponential Moving Average of depth
         depthEma_m = haveDptEma ? (depthEma_m * (1.0f - DPT_EMA_ALPHA) + d * DPT_EMA_ALPHA) : d;
         haveDptEma = true;
     }
@@ -535,6 +582,7 @@ static void handleDPT(char* fields[], uint8_t n) {
 
 static uint32_t lastNmeaByteMs = 0;
 
+// Reads chars from AltSoftSerial, forms NMEA strings, checks checksums, and routes to handlers
 static void readNMEA() {
     uint8_t guard = 0;
     while (nmeaSerial.available() && guard < 64) {
@@ -593,6 +641,7 @@ static void dbgCmd(const char* fmt, int val) {
 }
 #endif
 
+// Queues and dispatches MAVLink buffer directly over hardware Serial to Pixhawk
 static bool mavSend() {
     uint16_t len = mavlink_msg_to_send_buffer(mavBuf, &mavMsgTx);
     uint32_t waitStart = millis();
@@ -603,12 +652,14 @@ static bool mavSend() {
     return true;
 }
 
+// Emits MAVLink heartbeat packet to confirm connection health
 static void sendHeartbeat() {
     digitalWrite(HB_LED_PIN, !digitalRead(HB_LED_PIN));
     mavlink_msg_heartbeat_pack(SYS_ID, COMP_ID, &mavMsgTx, MAV_TYPE_ONBOARD_CONTROLLER, MAV_AUTOPILOT_INVALID, MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 0, MAV_STATE_ACTIVE);
     mavSend();
 }
 
+// Commands the flight controller to change modes (e.g., to GUIDED, LOITER, or HOLD)
 static bool sendSetMode(uint8_t mode) {
     mavlink_msg_set_mode_pack(SYS_ID, COMP_ID, &mavMsgTx, TARGET_SYS, MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, (uint32_t)mode);
     if (!mavSend()) return false;
@@ -618,6 +669,7 @@ static bool sendSetMode(uint8_t mode) {
     return true;
 }
 
+// Safe wrapper managing state checks and retry timeouts for mode transitions
 static bool requestModeChange(uint8_t mode, uint32_t now) {
     if (holdLatched && mode != ROVER_MODE_HOLD) {
         if (pendingMode == (int16_t)mode) pendingMode = -1;
@@ -648,6 +700,7 @@ static bool requestModeChange(uint8_t mode, uint32_t now) {
     return false;
 }
 
+// Instructs ArduRover to navigate to a specific global latitude and longitude
 static bool sendPositionTarget(int32_t lat, int32_t lon) {
     mavlink_set_position_target_global_int_t sp = {};
     sp.time_boot_ms = (uint32_t)millis();
@@ -661,6 +714,7 @@ static bool sendPositionTarget(int32_t lat, int32_t lon) {
     return mavSend();
 }
 
+// Instructs ArduRover to steer to a heading vector at a specific speed
 static void sendVelocityTarget(float headingDeg, float speed_ms) {
     if (vescNotActive) speed_ms = 0.0f;
     float hRad = headingDeg * (float)M_PI / 180.0f;
@@ -669,6 +723,7 @@ static void sendVelocityTarget(float headingDeg, float speed_ms) {
     sp.target_system = TARGET_SYS;
     sp.target_component = TARGET_COMP;
     sp.coordinate_frame = COORD_FRAME;
+    // Disables positional targets (bits 0,1,2) and acceleration targets (bits 6,7,8), explicitly enforcing velocity tracking
     sp.type_mask = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 10) | (1 << 11);
     sp.vx = speed_ms * cosf(hRad);
     sp.vy = speed_ms * sinf(hRad);
@@ -676,6 +731,7 @@ static void sendVelocityTarget(float headingDeg, float speed_ms) {
     mavSend();
 }
 
+// Transmits a DO_CHANGE_SPEED MAVLink command
 static bool sendSpeedCommand(float speed_ms) {
     mavlink_msg_command_long_pack(SYS_ID, COMP_ID, &mavMsgTx, TARGET_SYS, TARGET_COMP, MAV_CMD_DO_CHANGE_SPEED, 0, 1, speed_ms, -1, 0, 0, 0, 0);
     if (!mavSend()) return false;
@@ -685,6 +741,7 @@ static bool sendSpeedCommand(float speed_ms) {
     return true;
 }
 
+// Commands an immediate motor disarm sequence
 static bool sendDisarm() {
     mavlink_msg_command_long_pack(SYS_ID, COMP_ID, &mavMsgTx, TARGET_SYS, TARGET_COMP, MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0);
     if (!mavSend()) return false;
@@ -694,11 +751,13 @@ static bool sendDisarm() {
     return true;
 }
 
+// Dispatches a text string to Ground Control Stations (GCS)
 static void sendStatusText(uint8_t severity, const char* text) {
     mavlink_msg_statustext_pack(SYS_ID, COMP_ID, &mavMsgTx, severity, text, 0, 0);
     mavSend();
 }
 
+// Dispatches a PROGMEM text string to Ground Control Stations (GCS)
 static void sendStatusText_P(uint8_t severity, const char* text) {
     char buf[50];
     strncpy_P(buf, text, sizeof(buf) - 1);
@@ -707,6 +766,7 @@ static void sendStatusText_P(uint8_t severity, const char* text) {
 }
 
 // ---- MAVLink Receive Processing ----
+// Iterates and parses incoming MAVLink packets from hardware serial
 static void readMAVLink() {
     uint8_t maxBytesPerCall = 64;
     while (Serial.available() && maxBytesPerCall--) {
@@ -715,10 +775,12 @@ static void readMAVLink() {
 #if DEBUG_FREE_RAM
             checkFreeRam('M');
 #endif
+            // Validates telemetry link presence
             if (mavMsg.msgid == MAVLINK_MSG_ID_HEARTBEAT) {
                 lastHbSysid = mavMsg.sysid;
                 hbRxCount++;
             }
+            // Decodes host Heartbeat to track active auto-pilot mode updates
             if (mavMsg.msgid == MAVLINK_MSG_ID_HEARTBEAT && mavMsg.sysid == TARGET_SYS) {
                 mavlink_heartbeat_t hb;
                 mavlink_msg_heartbeat_decode(&mavMsg, &hb);
@@ -733,6 +795,7 @@ static void readMAVLink() {
                 pixhawkMode = newPixhawkMode;
                 pixhawkModeKnown = true;
             }
+            // Intercepts RC channels to facilitate on-the-fly speed trimming from a radio switch
             if (mavMsg.msgid == MAVLINK_MSG_ID_RC_CHANNELS_RAW) {
                 mavlink_rc_channels_raw_t rc;
                 mavlink_msg_rc_channels_raw_decode(&mavMsg, &rc);
@@ -773,30 +836,32 @@ static void readMAVLink() {
                             sendStatusText(MAV_SEVERITY_DEBUG, dbg);
                         }
 #endif
-                        if (navState != NavState::CONTOUR_FOLLOW) {  
-                            if (sendSpeedCommand(spd)) {  
-                                lastSentSpeed = spd;  
-                                lastSpeedSendMs = millis();  
-                                speedNeedsResend = false;  
-#if DEBUG_SPEED_TRIM  
-                                sendStatusText_P(MAV_SEVERITY_DEBUG, PSTR("TRIM: sent immediate"));  
-#endif  
-                            }  
-                        }  
-                    } else {  
-#if DEBUG_SPEED_TRIM  
-                        {  
-                            char rj[48];  
-                            snprintf(rj, sizeof(rj), "TRIM REJ st=%u ns=%d slot=%d rmbF=%d",  
-                                     (unsigned)trimState, (int)navState,  
-                                     (int)(int8_t)activeSpeedSlot,  
-                                     (int)(rmbActive && (millis() - lastRMBms) < RMB_TIMEOUT_MS));  
-                            sendStatusText(MAV_SEVERITY_DEBUG, rj);  
-                        }  
-#endif  
-                    }  
+                        // Send speed immediately if not actively following contour logic which updates continuously
+                        if (navState != NavState::CONTOUR_FOLLOW) {
+                            if (sendSpeedCommand(spd)) {
+                                lastSentSpeed = spd;
+                                lastSpeedSendMs = millis();
+                                speedNeedsResend = false;
+#if DEBUG_SPEED_TRIM
+                                sendStatusText_P(MAV_SEVERITY_DEBUG, PSTR("TRIM: sent immediate"));
+#endif
+                            }
+                        }
+                    } else {
+#if DEBUG_SPEED_TRIM
+                        {
+                            char rj[48];
+                            snprintf(rj, sizeof(rj), "TRIM REJ st=%u ns=%d slot=%d rmbF=%d",
+                                     (unsigned)trimState, (int)navState,
+                                     (int)(int8_t)activeSpeedSlot,
+                                     (int)(rmbActive && (millis() - lastRMBms) < RMB_TIMEOUT_MS));
+                            sendStatusText(MAV_SEVERITY_DEBUG, rj);
+                        }
+#endif
+                    }
                 }
             }
+            // Decodes Pixhawk global position metrics (used in circular math)
             if (mavMsg.msgid == MAVLINK_MSG_ID_GLOBAL_POSITION_INT) {
                 mavlink_global_position_int_t gp;
                 mavlink_msg_global_position_int_decode(&mavMsg, &gp);
@@ -812,6 +877,7 @@ static void readMAVLink() {
                     havePixhawkHeading = false;
                 }
             }
+            // Custom metric decoder for observing VESC node status
             if (mavMsg.msgid == MAVLINK_MSG_ID_NAMED_VALUE_FLOAT) {
                 mavlink_named_value_float_t nv;
                 mavlink_msg_named_value_float_decode(&mavMsg, &nv);
@@ -827,16 +893,18 @@ static void readMAVLink() {
 }
 
 // ---- Contour Control Logic ----
-static void gotoLoiterReset(uint8_t breadcrumb) {  
-    loiterConfirmed = false;  
-    navState = NavState::LOITER_WP_RESET;  
-#if DEBUG_BREADCRUMB  
-    EEPROM.update(EEPROM_ADDR_BREADCRUMB, breadcrumb);  
-#else  
-    (void)breadcrumb;  
-#endif  
+// Transitions to a holding pattern by asserting LOITER mode, effectively erasing current WP sequence
+static void gotoLoiterReset(uint8_t breadcrumb) {
+    loiterConfirmed = false;
+    navState = NavState::LOITER_WP_RESET;
+#if DEBUG_BREADCRUMB
+    EEPROM.update(EEPROM_ADDR_BREADCRUMB, breadcrumb);
+#else
+    (void)breadcrumb;
+#endif
 }
 
+// Establishes the geometric center for the initial circle search behavior during contour approach
 static void setCircleAnchor(float lat, int32_t lat_int, int32_t lon_int, float headingDeg) {
 #if DEBUG_FREE_RAM
     checkFreeRam('A');
@@ -850,6 +918,7 @@ static void setCircleAnchor(float lat, int32_t lat_int, int32_t lon_int, float h
     activationLon_int = lon_int;
     activationPosValid = true;
 
+    // Approximates the center of a tangent circle positioned CONTOUR_CIRCLE_RADIUS_M to the side
     float approachHeadingDeg = havePixhawkHeading ? pixhawkHeadingDeg : vtg_cog_deg;
     float hr = approachHeadingDeg * (float)M_PI / 180.0f;
     approachCenterLat_int = activationLat_int + (int32_t)((-sinf(hr)) * (CONTOUR_CIRCLE_RADIUS_M * 0.5f) * INT7_PER_METER_LAT);
@@ -879,6 +948,7 @@ static void setCircleAnchor(float lat, int32_t lat_int, int32_t lon_int, float h
 #endif
 }
 
+// Executes the initialization sequence to begin a new contour tracking task
 static void enterContourFollow() {
 #if DEBUG_BREADCRUMB
     EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_ENTER_CONTOUR_FOLLOW);
@@ -917,6 +987,7 @@ static void enterContourFollow() {
 #endif
 }
 
+// Recalibrates geometry when contour tracking was temporarily lost and the system reverts to survey mode
 static void reenterContourFromLastGood() {
 #if DEBUG_BREADCRUMB
     EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_REENTER_LAST_GOOD);
@@ -961,6 +1032,7 @@ void setup() {
     lastSend = millis();
 
     uint16_t magic = 0;
+    // Load persisted configurations ensuring magic byte validation to prevent garbage variables
     EEPROM.get(EEPROM_ADDR_MAGIC, magic);
     if (magic == EEPROM_MAGIC) {
         EEPROM.get(EEPROM_ADDR_TRAVEL_SPEED, travelSpeed);
@@ -995,6 +1067,7 @@ void setup() {
 }
 
 // ---- Extracted Loop Handlers ----
+// Refreshes the hardware watchdog and executes EEPROM diagnostic commits if no crash loop is present
 static bool updateWatchdogAndDiagnostics() {
     wdt_reset();
     loopCount++;
@@ -1018,6 +1091,7 @@ static bool updateWatchdogAndDiagnostics() {
     return true;
 }
 
+// Forces hold and disarm states if ESC/motor controller data goes stale or falls into an error condition
 static void handleVescMonitoring(uint32_t now) {
 #if DEBUG_NO_VESC
     vescStaleOrBad = false;
@@ -1050,6 +1124,7 @@ static void handleVescMonitoring(uint32_t now) {
 #endif
 }
 
+// Evaluates timeout mechanisms protecting against failed autopilot mode transitions
 static void handleModeConfirmFailsafe(uint32_t now) {
     if (modeConfirmFailsafe) {
         modeConfirmFailsafe = false;
@@ -1066,6 +1141,7 @@ static void handleModeConfirmFailsafe(uint32_t now) {
     }
 }
 
+// Manages standard waypoint navigation commands utilizing NMEA RMB updates
 static void handleGuidedState(uint32_t now, bool rmbFresh) {
     if (rmbFresh) {
         if (pixhawkModeKnown && pixhawkMode != ROVER_MODE_GUIDED) {
@@ -1098,15 +1174,15 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
                     bool speedChanged = fabsf(commandedSpeed - lastSentSpeed) > SPEED_RESEND_THRESHOLD_MS;
                     if (speedChanged || (now - lastSpeedSendMs >= SPEED_KEEPALIVE_MS)) {
                         if (sendSpeedCommand(commandedSpeed)) {
-#if DEBUG_SPEED_TRIM  
-                            if (speedChanged) {  
-                                char dbg[40];  
-                                char csStr[8], lsStr[8];  
-                                dtostrf(commandedSpeed, 4, 2, csStr);  
-                                dtostrf(lastSentSpeed, 4, 2, lsStr);  
-                                snprintf(dbg, sizeof(dbg), "TRIM chg=%d cs=%s ls=%s", (int)speedChanged, csStr, lsStr);  
-                                sendStatusText(MAV_SEVERITY_DEBUG, dbg);  
-                            }  
+#if DEBUG_SPEED_TRIM
+                            if (speedChanged) {
+                                char dbg[40];
+                                char csStr[8], lsStr[8];
+                                dtostrf(commandedSpeed, 4, 2, csStr);
+                                dtostrf(lastSentSpeed, 4, 2, lsStr);
+                                snprintf(dbg, sizeof(dbg), "TRIM chg=%d cs=%s ls=%s", (int)speedChanged, csStr, lsStr);
+                                sendStatusText(MAV_SEVERITY_DEBUG, dbg);
+                            }
 #endif
                             lastSpeedSendMs = now;
                             lastSentSpeed = commandedSpeed;
@@ -1131,6 +1207,7 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
     }
 }
 
+// Drives a brief transition into LOITER mode to flush any active Pixhawk missions
 static void handleLoiterWpResetState(uint32_t now, bool rmbFresh) {
     if (!loiterConfirmed) {
         if (pixhawkModeKnown && pixhawkMode == ROVER_MODE_LOITER) {
@@ -1155,6 +1232,7 @@ static void handleLoiterWpResetState(uint32_t now, bool rmbFresh) {
     }
 }
 
+// Pauses contour tracking logic and holds position if sonar data is permanently interrupted
 static void handleContourDepthLossRecovery(uint32_t now) {
     bool dptStaleNow = (now - lastDPTms) >= CONTOUR_DPT_LOSS_MS;
 
@@ -1196,6 +1274,7 @@ static void handleContourDepthLossRecovery(uint32_t now) {
     }
 }
 
+// First phase of contour logic: Steers the vessel into a tangent approach circle trajectory
 static void handleContourApproachPhase(uint32_t now) {
     if (haveDPT && depth_m < CONTOUR_SAFETY_DEPTH_M) {
         gotoLoiterReset(BC_LOITER_WP_RESET_APPROACH);
@@ -1219,6 +1298,7 @@ static void handleContourApproachPhase(uint32_t now) {
             circleApproachPrevTheta = theta;
         }
 
+        // When a semi-circle path is completed, advance logic to full circular survey
         if (fabsf(circleApproachAccumAngle) >= 180.0f) {
             circlePrevLat_int = currentLat_int;
             circlePrevLon_int = currentLon_int;
@@ -1230,9 +1310,9 @@ static void handleContourApproachPhase(uint32_t now) {
             depthSlopeCumDist = 0.0f;
             circleLastDepth = haveDPT ? depth_m : contourTargetDepth_m;
             surveyDptWasValid = haveDPT;
-            circleApproachSampled = false;  
-            contourPhase = ContourPhase::CIRCLE_SURVEY;  
-            activeSpeedSlot = SpeedSlot::TRAVEL;  
+            circleApproachSampled = false;
+            contourPhase = ContourPhase::CIRCLE_SURVEY;
+            activeSpeedSlot = SpeedSlot::TRAVEL;
 #if DEBUG_BREADCRUMB
             EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_SURVEY_ENTER);
 #endif
@@ -1250,6 +1330,7 @@ static void handleContourApproachPhase(uint32_t now) {
     }
 }
 
+// Second phase of contour logic: Executes a full circle, logging bathymetry slope to find optimal starting vector
 static void handleContourSurveyPhase(uint32_t now) {
     if (haveDPT && depth_m < CONTOUR_SAFETY_DEPTH_M) {
         gotoLoiterReset(BC_LOITER_WP_RESET_SURVEY);
@@ -1294,6 +1375,7 @@ static void handleContourSurveyPhase(uint32_t now) {
 
             float prevErr = circleLastDepth - contourTargetDepth_m;
             float currErr = depth_m - contourTargetDepth_m;
+            // Crosses zero-error line on the target contour depth
             bool crossed = (prevErr > 0.0f && currErr <= 0.0f) || (prevErr < 0.0f && currErr >= 0.0f) || (prevErr == 0.0f && currErr != 0.0f);
 
             if (crossed) {
@@ -1340,6 +1422,7 @@ static void handleContourSurveyPhase(uint32_t now) {
                     int32_t crossLon_int = circlePrevLon_int + (int32_t)((currentLon_int - circlePrevLon_int) * crossFrac);
                     bool acceptedA = false, acceptedB = false;
 
+                    // Choose alignment best matching original approach vector
                     if (devA <= devB) {
                         if (devA < circleBestDev) {
                             circleBestDev = devA;
@@ -1391,6 +1474,7 @@ static void handleContourSurveyPhase(uint32_t now) {
         while (corrHead >= 360.0f) corrHead -= 360.0f;
         sendVelocityTarget(corrHead, activeSpeedSlot == SpeedSlot::FISHING ? fishingSpeed : travelSpeed);
 
+        // When a full circle is completed, analyze data and enter follow phase
         if (circleAccumAngle >= 360.0f || circleAccumAngle <= -360.0f) {
             if (circleCrossFound) {
                 contourBaseHeadingDeg = circleBestHeading;
@@ -1421,6 +1505,7 @@ static void handleContourSurveyPhase(uint32_t now) {
 #if DEBUG_SURVEY
                 sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("CONTOUR: lap no cross -> retry"));
 #endif
+                // Survey failed to find sufficient gradient, clear accumulators and repeat lap
                 circleAccumAngle = 0.0f;
                 circleCrossFound = false;
                 circleBestDev = 999.0f;
@@ -1431,11 +1516,12 @@ static void handleContourSurveyPhase(uint32_t now) {
                 surveyDptWasValid = haveDPT;
             }
         }
-    } else {  
-        sendVelocityTarget(contourHeadingDeg, activeSpeedSlot == SpeedSlot::FISHING ? fishingSpeed : travelSpeed);  
-    }  
-}  
-  
+    } else {
+        sendVelocityTarget(contourHeadingDeg, activeSpeedSlot == SpeedSlot::FISHING ? fishingSpeed : travelSpeed);
+    }
+}
+
+// Third phase of contour logic: PID-style tracking of depth errors continuously updating trajectory angles
 static void handleContourFollowPhase(uint32_t now) {
     if (haveDPT && depth_m < CONTOUR_SAFETY_DEPTH_M) {
         gotoLoiterReset(BC_LOITER_WP_RESET_FOLLOW);
@@ -1446,6 +1532,7 @@ static void handleContourFollowPhase(uint32_t now) {
 #endif
         if (haveDPT) {
             float error = contourTargetDepth_m - depth_m;
+            // Instability flip abort logic – detects sharp deviations rendering current side bias obsolete
             if (fabsf(error) - fabsf(followPrevError_m) > CONTOUR_FLIP_ABORT_M && (now - lastSideFlipMs) >= CONTOUR_FLIP_GATE_MS) {
                 contourKpSigned = -contourKpSigned;
                 contourBaseHeadingDeg = contourHeadingDeg - lastContourOffsetDeg;
@@ -1456,6 +1543,7 @@ static void handleContourFollowPhase(uint32_t now) {
             }
             followPrevError_m = error;
 
+            // Proportional offset calculation pushing heading vector toward target depth
             float offset = contourKpSigned * CONTOUR_GAIN_DEG_PER_M * error;
             if (offset > CONTOUR_MAX_OFFSET_DEG) offset = CONTOUR_MAX_OFFSET_DEG;
             if (offset < -CONTOUR_MAX_OFFSET_DEG) offset = -CONTOUR_MAX_OFFSET_DEG;
@@ -1484,6 +1572,7 @@ static void handleContourFollowPhase(uint32_t now) {
                 float dEs = (currentLon_int - contourLastGoodLon_int) * METERS_PER_INT7_LAT * cosf(currentLat_deg * (float)M_PI / 180.0f);
                 float satDist = sqrtf(dNs * dNs + dEs * dEs);
 
+                // Reverts back to survey mode if line is lost beyond distance or temporal bounds
                 if ((now - contourLastGoodMs) >= CONTOUR_LOST_TIMEOUT_MS || satDist >= CONTOUR_LOST_DIST_M) {
 #if DEBUG_BREADCRUMB
                     EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_FOLLOW_REENTER);
@@ -1494,6 +1583,7 @@ static void handleContourFollowPhase(uint32_t now) {
                 }
             }
         }
+        // Incorporates macro trend nudge modifying base heading if systematic tracking bias exists
         if (haveCurrentPos && contourTrendRefSet) {
             float dN2 = (currentLat_int - contourTrendRefLat_int) * METERS_PER_INT7_LAT;
             float dE2 = (currentLon_int - contourTrendRefLon_int) * METERS_PER_INT7_LAT * contourTrendRefCosLat;
@@ -1528,6 +1618,7 @@ static void handleContourFollowPhase(uint32_t now) {
     }
 }
 
+// Top-level delegator function distributing logic ticks based on the active ContourPhase
 static void handleContourFollowState(uint32_t now, bool rmbFresh) {
     handleContourDepthLossRecovery(now);
 
@@ -1575,12 +1666,15 @@ static void handleContourFollowState(uint32_t now, bool rmbFresh) {
 }
 
 // ---- Main Loop ----
+// Primary execution thread called endlessly by the Arduino runtime
 void loop() {
     if (!updateWatchdogAndDiagnostics()) return;
 
+    // Fast-polling of Serial buses
     readNMEA();
     readMAVLink();
 
+    // Commit speed configurations changed via radio RC switch to EEPROM if delay period expired
     if (speedDirty && (millis() - speedChangedMs) >= EEPROM_WRITE_DELAY_MS) {
         EEPROM.put(EEPROM_ADDR_MAGIC, EEPROM_MAGIC);
         EEPROM.put(EEPROM_ADDR_TRAVEL_SPEED, travelSpeed);
@@ -1598,27 +1692,29 @@ void loop() {
     }
 #endif
 
-    if (now - lastHeartbeat >= HB_INTERVAL_MS) {  
-        sendHeartbeat();  
+    // Keepalive telemetry ticker for GCS visibility
+    if (now - lastHeartbeat >= HB_INTERVAL_MS) {
+        sendHeartbeat();
         lastHeartbeat = now;
-#if DEBUG_LINK  
-        static uint8_t lastPm = 0xFF, lastPk = 0xFF;  
-        static uint16_t pmDiv = 0;  
-        if (pixhawkMode != lastPm || pixhawkModeKnown != lastPk || (++pmDiv % 30 == 0)) {  
-            lastPm = pixhawkMode; lastPk = pixhawkModeKnown;  
-            char st[48];  
-            snprintf(st, sizeof(st), "PM=%u PK=%u SY=%u HB=%u AF=%d",  
-                     (unsigned)pixhawkMode, (unsigned)pixhawkModeKnown,  
-                     (unsigned)lastHbSysid, (unsigned)hbRxCount,  
-                     (int)Serial.availableForWrite());  
-            sendStatusText(MAV_SEVERITY_DEBUG, st);  
-        }  
+#if DEBUG_LINK
+        static uint8_t lastPm = 0xFF, lastPk = 0xFF;
+        static uint16_t pmDiv = 0;
+        if (pixhawkMode != lastPm || pixhawkModeKnown != lastPk || (++pmDiv % 30 == 0)) {
+            lastPm = pixhawkMode; lastPk = pixhawkModeKnown;
+            char st[48];
+            snprintf(st, sizeof(st), "PM=%u PK=%u SY=%u HB=%u AF=%d",
+                     (unsigned)pixhawkMode, (unsigned)pixhawkModeKnown,
+                     (unsigned)lastHbSysid, (unsigned)hbRxCount,
+                     (int)Serial.availableForWrite());
+            sendStatusText(MAV_SEVERITY_DEBUG, st);
+        }
 #endif
     }
 
     handleVescMonitoring(now);
     handleModeConfirmFailsafe(now);
 
+    // 1Hz execution clock used for slower logic evaluations and state machine advancements
     if (now - lastSend >= SEND_INTERVAL_MS) {
         lastSend = now;
         if (haveVTG && (now - lastVTGms) >= VTG_TIMEOUT_MS) {
