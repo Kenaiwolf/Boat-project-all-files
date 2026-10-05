@@ -1598,8 +1598,9 @@ void loop() {
     }
 #endif
 
-    if (now - lastHeartbeat >= HB_INTERVAL_MS) {
-        sendHeartbeat();
+    if (now - lastHeartbeat >= HB_INTERVAL_MS) {  
+        sendHeartbeat();  
+        lastHeartbeat = now;
 #if DEBUG_LINK  
         static uint8_t lastPm = 0xFF, lastPk = 0xFF;  
         static uint16_t pmDiv = 0;  
