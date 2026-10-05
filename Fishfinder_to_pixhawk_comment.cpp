@@ -218,8 +218,8 @@ static NavState navState = NavState::GUIDED; // Active operational logic state
 // rmb* Subsystem (NMEA Route Status)
 static bool rmbActive = false;               // Current RMB message valid flag
 static bool rmbEverActive = false;           // Indicates if RMB was received since boot
-static int32_t rmb_lat = 0;                  // Target longitude from RMB (1e7 deg)
-static int32_t rmb_lon = 0;                  // Target latitude from RMB (1e7 deg)
+static int32_t rmb_lat = 0;                  // Target latitude from RMB (1e7 deg)  
+static int32_t rmb_lon = 0;                  // Target longitude from RMB (1e7 deg)
 static uint32_t lastRMBms = 0;               // Timestamp of last parsed RMB sentence
 static char prevDestWpId[13] = "";           // ID of previous destination WP
 static char lastLoiterResetDestId[13] = "";  // ID of WP mapped prior to loiter
@@ -318,14 +318,14 @@ static uint32_t loiterStartMs = 0;           // Timer to clear waypoint path
 static bool loiterConfirmed = false;         // Pixhawk asserted loiter mode
 static uint32_t lastSend = 0;                // MAVLink periodic clock
 static bool waypointReset = false;           // Needs path regeneration
-static uint32_t lastHeartbeat = 0;           // Next packet timestamp
+static uint32_t lastHeartbeat = 0;           // Timestamp of last sent heartbeat
 static int16_t pendingMode = -1;             // Desired operating mode
 static uint32_t pendingStartMs = 0;          // Timeout tracker for switch validation
 static uint32_t pendingLastSendMs = 0;       // Resend delay for commands
 #define MODE_CONFIRM_TIMEOUT_MS 5000UL
 static bool modeConfirmFailsafe = false;     // Triggered on MAVLink failure
 static bool holdLatched = false;             // Mandatory manual override mode lock
-static float pixhawkHeadingDeg = 0.0f;       // Active IMU absolute orientation
+static float pixhawkHeadingDeg = 0.0f;       // Heading from GLOBAL_POSITION_INT (EKF, deg)
 static bool havePixhawkHeading = false;      // Valid heading parsed flag
 static float currentLat_deg = 0.0f;          // Absolute global current position
 static int32_t currentLat_int = 0;           // Global position (1e7 deg)
@@ -723,7 +723,7 @@ static void sendVelocityTarget(float headingDeg, float speed_ms) {
     sp.target_system = TARGET_SYS;
     sp.target_component = TARGET_COMP;
     sp.coordinate_frame = COORD_FRAME;
-    // Disables positional targets (bits 0,1,2) and acceleration targets (bits 6,7,8), explicitly enforcing velocity tracking
+    // Ignore mask: pos (bits 0,1,2), vz (bit 5), accel (bits 6,7,8), yaw/yaw-rate (bits 10,11) — leaves vx/vy velocity tracking active
     sp.type_mask = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 10) | (1 << 11);
     sp.vx = speed_ms * cosf(hRad);
     sp.vy = speed_ms * sinf(hRad);
@@ -893,7 +893,7 @@ static void readMAVLink() {
 }
 
 // ---- Contour Control Logic ----
-// Transitions to a holding pattern by asserting LOITER mode, effectively erasing current WP sequence
+// Sets navState to LOITER_WP_RESET; the actual SET_MODE->LOITER is sent by handleLoiterWpResetState()
 static void gotoLoiterReset(uint8_t breadcrumb) {
     loiterConfirmed = false;
     navState = NavState::LOITER_WP_RESET;
@@ -1232,7 +1232,7 @@ static void handleLoiterWpResetState(uint32_t now, bool rmbFresh) {
     }
 }
 
-// Pauses contour tracking logic and holds position if sonar data is permanently interrupted
+// Pauses contour tracking and holds position when DPT data goes stale longer than CONTOUR_DPT_LOSS_MS (4 s)
 static void handleContourDepthLossRecovery(uint32_t now) {
     bool dptStaleNow = (now - lastDPTms) >= CONTOUR_DPT_LOSS_MS;
 
@@ -1521,7 +1521,7 @@ static void handleContourSurveyPhase(uint32_t now) {
     }
 }
 
-// Third phase of contour logic: PID-style tracking of depth errors continuously updating trajectory angles
+// Third phase of contour logic: proportional (P-only) tracking of depth error continuously updating trajectory heading
 static void handleContourFollowPhase(uint32_t now) {
     if (haveDPT && depth_m < CONTOUR_SAFETY_DEPTH_M) {
         gotoLoiterReset(BC_LOITER_WP_RESET_FOLLOW);
