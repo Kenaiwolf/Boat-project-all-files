@@ -56,7 +56,7 @@ static mavlink_message_t mavMsg;
 #define MIN_SPEED_MS 0.1f
 #define SPEED_STEP_MS 0.06f
 #define SPEED_DEADBAND_US 200
-#define SPEED_TRIM_CHANNEL 3
+#define SPEED_TRIM_CHANNEL 2
 
 #define TYPE_MASK ((uint16_t)((1<<3)|(1<<4)|(1<<5)|(1<<6)|(1<<7)|(1<<8)|(1<<10)|(1<<11)))
 #define COORD_FRAME MAV_FRAME_GLOBAL_INT
@@ -455,16 +455,20 @@ static void handleRMB(char* fields[], uint8_t n) {
     rmbEverActive = true;
     lastRMBms = millis();
 
-#if DEBUG_RMB_PARSE
-    {
-        char dbg[64];
-        snprintf_P(dbg, sizeof(dbg),
-            PSTR("RMB dC=%d arr=%d mWP=%d trg=%d slot=%d id=%s"),
-            (int)destChanged, (int)rmbArrived, (int)routeIsMultiWP,
-            (int)contourTrigger,
-            (int)(int8_t)activeSpeedSlot, prevDestWpId);
-        sendStatusText(MAV_SEVERITY_DEBUG, dbg);
-    }
+#if DEBUG_RMB_PARSE  
+    {  
+        static uint8_t lastArr = 255, lastTrg = 255, lastDC = 255;  
+        if (destChanged != lastDC || rmbArrived != lastArr || contourTrigger != lastTrg) {  
+            lastDC = destChanged; lastArr = rmbArrived; lastTrg = contourTrigger;  
+            char dbg[64];  
+            snprintf_P(dbg, sizeof(dbg),  
+                PSTR("RMB dC=%d arr=%d mWP=%d trg=%d slot=%d id=%s"),  
+                (int)destChanged, (int)rmbArrived, (int)routeIsMultiWP,  
+                (int)contourTrigger,  
+                (int)(int8_t)activeSpeedSlot, prevDestWpId);  
+            sendStatusText(MAV_SEVERITY_DEBUG, dbg);  
+        }  
+    }  
 #endif
 }
 
@@ -505,16 +509,16 @@ static void handleDPT(char* fields[], uint8_t n) {
     } else {
         dptGlitchCount = 0;
     }
-#if DEBUG_FOLLOW || DEBUG_SURVEY
-    {
-        char dbg[48];
-        char dRaw[8], dGl[8];
-        dtostrf(d, 6, 2, dRaw);
-        dtostrf(glitch, 6, 2, dGl);
-        snprintf_P(dbg, sizeof(dbg), PSTR("DPT raw=%s gl=%s cnt=%d acc=%d"),
-                 dRaw, dGl, (int)dptGlitchCount, (int)accept);
-        sendStatusText(MAV_SEVERITY_DEBUG, dbg);
-    }
+#if DEBUG_CONTOUR_TUNING  
+    {  
+        char dbg[48];  
+        char dRaw[8], dGl[8];  
+        dtostrf(d, 6, 2, dRaw);  
+        dtostrf(glitch, 6, 2, dGl);  
+        snprintf_P(dbg, sizeof(dbg), PSTR("DPT raw=%s gl=%s cnt=%d acc=%d"),  
+                 dRaw, dGl, (int)dptGlitchCount, (int)accept);  
+        sendStatusText(MAV_SEVERITY_DEBUG, dbg);  
+    }  
 #endif
 #endif
 
@@ -550,9 +554,9 @@ static void readNMEA() {
             nmeaBuf[nmeaIdx] = '\0';
             if (nmeaIdx > 6 && nmeaChecksumValid(nmeaBuf)) {
 #if DEBUG_LINK
-                if (strstr(nmeaBuf, "RMB") != NULL) {
-                    sendStatusText(MAV_SEVERITY_DEBUG, nmeaBuf);
-                }
+//                if (strstr(nmeaBuf, "RMB") != NULL) {					//RAW NMEA ECHO FORWARD TO GCS
+//                    sendStatusText(MAV_SEVERITY_DEBUG, nmeaBuf);
+//                }
 #endif
                 char* fields[16];
                 uint8_t n = splitFields(nmeaBuf, fields, 16);
@@ -769,17 +773,28 @@ static void readMAVLink() {
                             sendStatusText(MAV_SEVERITY_DEBUG, dbg);
                         }
 #endif
-                        if (navState != NavState::CONTOUR_FOLLOW) {
-                            if (sendSpeedCommand(spd)) {
-                                lastSentSpeed = spd;
-                                lastSpeedSendMs = millis();
-                                speedNeedsResend = false;
-#if DEBUG_SPEED_TRIM
-                                sendStatusText_P(MAV_SEVERITY_DEBUG, PSTR("TRIM: sent immediate"));
-#endif
-                            }
-                        }
-                    }
+                        if (navState != NavState::CONTOUR_FOLLOW) {  
+                            if (sendSpeedCommand(spd)) {  
+                                lastSentSpeed = spd;  
+                                lastSpeedSendMs = millis();  
+                                speedNeedsResend = false;  
+#if DEBUG_SPEED_TRIM  
+                                sendStatusText_P(MAV_SEVERITY_DEBUG, PSTR("TRIM: sent immediate"));  
+#endif  
+                            }  
+                        }  
+                    } else {  
+#if DEBUG_SPEED_TRIM  
+                        {  
+                            char rj[48];  
+                            snprintf(rj, sizeof(rj), "TRIM REJ st=%u ns=%d slot=%d rmbF=%d",  
+                                     (unsigned)trimState, (int)navState,  
+                                     (int)(int8_t)activeSpeedSlot,  
+                                     (int)(rmbActive && (millis() - lastRMBms) < RMB_TIMEOUT_MS));  
+                            sendStatusText(MAV_SEVERITY_DEBUG, rj);  
+                        }  
+#endif  
+                    }  
                 }
             }
             if (mavMsg.msgid == MAVLINK_MSG_ID_GLOBAL_POSITION_INT) {
@@ -1083,15 +1098,15 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
                     bool speedChanged = fabsf(commandedSpeed - lastSentSpeed) > SPEED_RESEND_THRESHOLD_MS;
                     if (speedChanged || (now - lastSpeedSendMs >= SPEED_KEEPALIVE_MS)) {
                         if (sendSpeedCommand(commandedSpeed)) {
-#if DEBUG_SPEED_TRIM
-                            {
-                                char dbg[40];
-                                char csStr[8], lsStr[8];
-                                dtostrf(commandedSpeed, 4, 2, csStr);
-                                dtostrf(lastSentSpeed, 4, 2, lsStr);
-                                snprintf(dbg, sizeof(dbg), "TRIM chg=%d cs=%s ls=%s", (int)speedChanged, csStr, lsStr);
-                                sendStatusText(MAV_SEVERITY_DEBUG, dbg);
-                            }
+#if DEBUG_SPEED_TRIM  
+                            if (speedChanged) {  
+                                char dbg[40];  
+                                char csStr[8], lsStr[8];  
+                                dtostrf(commandedSpeed, 4, 2, csStr);  
+                                dtostrf(lastSentSpeed, 4, 2, lsStr);  
+                                snprintf(dbg, sizeof(dbg), "TRIM chg=%d cs=%s ls=%s", (int)speedChanged, csStr, lsStr);  
+                                sendStatusText(MAV_SEVERITY_DEBUG, dbg);  
+                            }  
 #endif
                             lastSpeedSendMs = now;
                             lastSentSpeed = commandedSpeed;
@@ -1585,14 +1600,18 @@ void loop() {
 
     if (now - lastHeartbeat >= HB_INTERVAL_MS) {
         sendHeartbeat();
-        lastHeartbeat = now;
-#if DEBUG_LINK
-        char st[48];
-        snprintf(st, sizeof(st), "PM=%u PK=%u SY=%u HB=%u AF=%d",
-                 (unsigned)pixhawkMode, (unsigned)pixhawkModeKnown,
-                 (unsigned)lastHbSysid, (unsigned)hbRxCount,
-                 (int)Serial.availableForWrite());
-        sendStatusText(MAV_SEVERITY_DEBUG, st);
+#if DEBUG_LINK  
+        static uint8_t lastPm = 0xFF, lastPk = 0xFF;  
+        static uint16_t pmDiv = 0;  
+        if (pixhawkMode != lastPm || pixhawkModeKnown != lastPk || (++pmDiv % 30 == 0)) {  
+            lastPm = pixhawkMode; lastPk = pixhawkModeKnown;  
+            char st[48];  
+            snprintf(st, sizeof(st), "PM=%u PK=%u SY=%u HB=%u AF=%d",  
+                     (unsigned)pixhawkMode, (unsigned)pixhawkModeKnown,  
+                     (unsigned)lastHbSysid, (unsigned)hbRxCount,  
+                     (int)Serial.availableForWrite());  
+            sendStatusText(MAV_SEVERITY_DEBUG, st);  
+        }  
 #endif
     }
 
