@@ -1,3 +1,6 @@
+
+// na flesh arduina nano pripojeneho k pixhawk je notne nastavit na pixhawk serial port na -1 co je vypnuty!
+
 // ---- Includes & MAVLink Buffer Setup ----
 #define SERIAL_TX_BUFFER_SIZE 128
 #define SERIAL_RX_BUFFER_SIZE 128
@@ -41,7 +44,7 @@ static mavlink_message_t mavMsg;
 
 // ---- Config Constants ----
 #define MAV_BAUD 57600UL
-#define NMEA_BAUD 4800UL // 598ci HD
+#define NMEA_BAUD 38400UL // HELIX
 #define TARGET_SYS 1
 #define TARGET_COMP 1
 #define SYS_ID 1
@@ -131,16 +134,17 @@ static mavlink_message_t mavMsg;
 #define BC_FOLLOW_LOOP_TOP 18
 
 // ---- Debug Flags ----
-#define DEBUG_RMB_PARSE 0
+#define DEBUG_RMB_PARSE 1
 #define DEBUG_GUIDED 1
 #define DEBUG_APPROACH 1
 #define DEBUG_SURVEY 1
 #define DEBUG_FOLLOW 1
-#define DEBUG_CONTOUR_TUNING 1
-#define DEBUG_SPEED_TRIM 0
-#define DEBUG_FREE_RAM 0
+#define DEBUG_CONTOUR_TUNING 0
+#define DEBUG_SPEED_TRIM 1
+#define DEBUG_FREE_RAM 0  
+#define DEBUG_BREADCRUMB 0   // gates all EEPROM breadcrumb writes (EEPROM wear mitigation) — enable only when diagnosing a crash
 #define DEBUG_LINK 0
-#define DEBUG_NO_VESC 1
+#define DEBUG_NO_VESC 0
 #include <avr/pgmspace.h>
 
 #if DEBUG_FREE_RAM
@@ -458,7 +462,7 @@ static void handleRMB(char* fields[], uint8_t n) {
             PSTR("RMB dC=%d arr=%d mWP=%d trg=%d slot=%d id=%s"),
             (int)destChanged, (int)rmbArrived, (int)routeIsMultiWP,
             (int)contourTrigger,
-            (int)(int8_t)SpeedSlot, prevDestWpId);
+            (int)(int8_t)activeSpeedSlot, prevDestWpId);
         sendStatusText(MAV_SEVERITY_DEBUG, dbg);
     }
 #endif
@@ -808,17 +812,23 @@ static void readMAVLink() {
 }
 
 // ---- Contour Control Logic ----
-static void gotoLoiterReset(uint8_t breadcrumb) {
-    loiterConfirmed = false;
-    navState = NavState::LOITER_WP_RESET;
-    EEPROM.update(EEPROM_ADDR_BREADCRUMB, breadcrumb);
+static void gotoLoiterReset(uint8_t breadcrumb) {  
+    loiterConfirmed = false;  
+    navState = NavState::LOITER_WP_RESET;  
+#if DEBUG_BREADCRUMB  
+    EEPROM.update(EEPROM_ADDR_BREADCRUMB, breadcrumb);  
+#else  
+    (void)breadcrumb;  
+#endif  
 }
 
 static void setCircleAnchor(float lat, int32_t lat_int, int32_t lon_int, float headingDeg) {
 #if DEBUG_FREE_RAM
     checkFreeRam('A');
 #endif
+#if DEBUG_BREADCRUMB
     EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_SET_CIRCLE_ANCHOR);
+#endif
     activationHeadingDeg = headingDeg;
     activationLat_int = lat_int;
     activationCosLat = cosf(lat * (float)M_PI / 180.0f);
@@ -855,7 +865,9 @@ static void setCircleAnchor(float lat, int32_t lat_int, int32_t lon_int, float h
 }
 
 static void enterContourFollow() {
+#if DEBUG_BREADCRUMB
     EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_ENTER_CONTOUR_FOLLOW);
+#endif
     float entryHeadingDeg = lastLegHeadingDeg;
     contourHeadingDeg = entryHeadingDeg;
     contourBaseHeadingDeg = entryHeadingDeg;
@@ -891,7 +903,9 @@ static void enterContourFollow() {
 }
 
 static void reenterContourFromLastGood() {
+#if DEBUG_BREADCRUMB
     EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_REENTER_LAST_GOOD);
+#endif
     if (contourLastGoodValid) {
         float lat_deg = contourLastGoodLat_int * 1e-7f;
         contourHeadingDeg = contourLastGoodHeadingDeg;
@@ -947,7 +961,9 @@ void setup() {
     lastSpeedSendMs = millis() - 5001UL;
     waypointReset = true;
     lastBreadcrumb = EEPROM.read(EEPROM_ADDR_BREADCRUMB);
+#if DEBUG_BREADCRUMB
     EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_BOOT);
+#endif
 
     #define SESSION_OK_LOOP_MIN 500UL
     EEPROM.get(EEPROM_ADDR_MIN_RAM, lastMinRam);
@@ -1004,7 +1020,9 @@ static void handleVescMonitoring(uint32_t now) {
     vescNotActive = vescStaleOrBad || (vescState != 2);
     bool vescFailsafe = (!vescStaleOrBad && vescState == 4);
     if (vescFailsafe || vescStaleOrBad) {
+#if DEBUG_BREADCRUMB
         EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_VESC_FAILSAFE);
+#endif
         holdLatched = true;
         requestModeChange(ROVER_MODE_HOLD, now);
         if (!vescDisarmSent && sendDisarm()) {
@@ -1021,7 +1039,9 @@ static void handleModeConfirmFailsafe(uint32_t now) {
     if (modeConfirmFailsafe) {
         modeConfirmFailsafe = false;
         if (!(pixhawkModeKnown && pixhawkMode == ROVER_MODE_HOLD)) {
+#if DEBUG_BREADCRUMB
             EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_MODE_CONFIRM_TIMEOUT);
+#endif
             holdLatched = true;
             sendStatusText_P(MAV_SEVERITY_CRITICAL, PSTR("MODE CONFIRM TIMEOUT->HOLD"));
         }
@@ -1130,7 +1150,9 @@ static void handleContourDepthLossRecovery(uint32_t now) {
             contourHoldLat_int = currentLat_int;
             contourHoldLon_int = currentLon_int;
         }
+#if DEBUG_BREADCRUMB
         EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_CONTOUR_DEPTH_LOST);
+#endif
 #if DEBUG_APPROACH || DEBUG_SURVEY || DEBUG_FOLLOW
         sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("CONTOUR: depth lost -> hold"));
 #endif
@@ -1150,7 +1172,9 @@ static void handleContourDepthLossRecovery(uint32_t now) {
             sendSpeedCommand(travelSpeed);
             activeSpeedSlot = SpeedSlot::TRAVEL;
         }
+#if DEBUG_BREADCRUMB
         EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_CONTOUR_DEPTH_RECOVERED);
+#endif
 #if DEBUG_APPROACH || DEBUG_SURVEY || DEBUG_FOLLOW
         sendStatusText_P(MAV_SEVERITY_INFO, PSTR("CONTOUR: depth back ->  recircle"));
 #endif
@@ -1194,7 +1218,9 @@ static void handleContourApproachPhase(uint32_t now) {
             circleApproachSampled = false;  
             contourPhase = ContourPhase::CIRCLE_SURVEY;  
             activeSpeedSlot = SpeedSlot::TRAVEL;  
+#if DEBUG_BREADCRUMB
             EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_SURVEY_ENTER);
+#endif
 #if DEBUG_GUIDED || DEBUG_APPROACH || DEBUG_SURVEY
             sendStatusText_P(MAV_SEVERITY_INFO, PSTR("CONTOUR: survey phase entered"));
 #endif
@@ -1365,7 +1391,9 @@ static void handleContourSurveyPhase(uint32_t now) {
                 contourLastGoodValid = true;
 
                 contourPhase = ContourPhase::FOLLOW;
+#if DEBUG_BREADCRUMB
                 EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_FOLLOW_ENTER);
+#endif
                 sendSpeedCommand(fishingSpeed);
                 activeSpeedSlot = SpeedSlot::FISHING;
 #if DEBUG_SURVEY || DEBUG_FOLLOW
@@ -1398,7 +1426,9 @@ static void handleContourFollowPhase(uint32_t now) {
         gotoLoiterReset(BC_LOITER_WP_RESET_FOLLOW);
         sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("CONTOUR: shallow depth -> LOITER (follow)"));
     } else {
+#if DEBUG_BREADCRUMB
         EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_FOLLOW_LOOP_TOP);
+#endif
         if (haveDPT) {
             float error = contourTargetDepth_m - depth_m;
             if (fabsf(error) - fabsf(followPrevError_m) > CONTOUR_FLIP_ABORT_M && (now - lastSideFlipMs) >= CONTOUR_FLIP_GATE_MS) {
@@ -1421,7 +1451,9 @@ static void handleContourFollowPhase(uint32_t now) {
             while (contourHeadingDeg < 0.0f) contourHeadingDeg += 360.0f;
             while (contourHeadingDeg >= 360.0f) contourHeadingDeg -= 360.0f;
 
+#if DEBUG_BREADCRUMB
             EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_FOLLOW_HEADING_DONE);
+#endif
             bool nowInGood = fabsf(error) <= CONTOUR_CORRECT_DEPTH_M;
 
             if (nowInGood && haveCurrentPos) {
@@ -1438,7 +1470,9 @@ static void handleContourFollowPhase(uint32_t now) {
                 float satDist = sqrtf(dNs * dNs + dEs * dEs);
 
                 if ((now - contourLastGoodMs) >= CONTOUR_LOST_TIMEOUT_MS || satDist >= CONTOUR_LOST_DIST_M) {
+#if DEBUG_BREADCRUMB
                     EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_FOLLOW_REENTER);
+#endif
                     reenterContourFromLastGood();
                     sendVelocityTarget(contourHeadingDeg, travelSpeed);
                     return;
@@ -1472,7 +1506,9 @@ static void handleContourFollowPhase(uint32_t now) {
             contourTrendRefCosLat = cosf(currentLat_deg * (float)M_PI / 180.0f);
             contourTrendRefSet = true;
         }
+#if DEBUG_BREADCRUMB
         EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_FOLLOW_SEND_DONE);
+#endif
         sendVelocityTarget(contourHeadingDeg, fishingSpeed);
     }
 }
