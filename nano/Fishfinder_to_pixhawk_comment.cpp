@@ -527,9 +527,8 @@ static void handleVTG(char* fields[], uint8_t n) {
     if (fields[1][0]) {
         vtg_cog_deg = parseFloat(fields[1]);
         haveVTGcog = true;
-    } else {
-        haveVTGcog = false;
     }
+	// empty COG field keeps last known value — cleared only by VTG_TIMEOUT_MS
 }
 
 // Parses NMEA DPT (Depth) outputted by the sonar
@@ -919,7 +918,9 @@ static void setCircleAnchor(float lat, int32_t lat_int, int32_t lon_int, float h
     activationPosValid = true;
 
     // Approximates the center of a tangent circle positioned CONTOUR_CIRCLE_RADIUS_M to the side
-    float approachHeadingDeg = havePixhawkHeading ? pixhawkHeadingDeg : vtg_cog_deg;
+    float approachHeadingDeg = havePixhawkHeading ? pixhawkHeadingDeg
+                            : haveVTGcog ? vtg_cog_deg
+                            : headingDeg;
     float hr = approachHeadingDeg * (float)M_PI / 180.0f;
     approachCenterLat_int = activationLat_int + (int32_t)((-sinf(hr)) * (CONTOUR_CIRCLE_RADIUS_M * 0.5f) * INT7_PER_METER_LAT);
     approachCenterLon_int = activationLon_int + (int32_t)((cosf(hr)) * (CONTOUR_CIRCLE_RADIUS_M * 0.5f) * INT7_PER_METER_LAT / activationCosLat);
@@ -1192,7 +1193,8 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
             }
         }
     } else if (!waypointReset && rmbEverActive) {
-        if (contourTrigger && haveDPT && haveVTGcog) {
+        if (contourTrigger && haveDPT && haveCurrentPos &&
+            haveLastLegHeading && (havePixhawkHeading || haveVTGcog)) {
             enterContourFollow();
         } else if (pixhawkMode == ROVER_MODE_HOLD) {
             // Guard: Intentionally do nothing to prevent LOITER reset while in HOLD mode
@@ -1205,8 +1207,12 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
                 sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER wp reset (no trg)"));
             else if (!haveDPT)
                 sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER wp reset (no DPT)"));
+            else if (!haveCurrentPos)
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER wp reset (no pos)"));
+            else if (!haveLastLegHeading)
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER wp reset (no leg)"));
             else
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER wp reset (no VTGcog)"));
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER wp reset (no hdg)"));
 #endif
         }
     }
