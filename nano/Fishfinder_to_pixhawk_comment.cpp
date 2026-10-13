@@ -165,7 +165,7 @@ static mavlink_message_t mavMsg;
 
 // ---- Debug Flags ----
 // Feature flags to enable or disable MAVLink status text debugging
-#define DEBUG_RMB_PARSE 1
+#define DEBUG_RMB_PARSE 0
 #define DEBUG_GUIDED 1
 #define DEBUG_APPROACH 1
 #define DEBUG_SURVEY 1
@@ -218,7 +218,7 @@ static NavState navState = NavState::GUIDED; // Active operational logic state
 // rmb* Subsystem (NMEA Route Status)
 static bool rmbActive = false;               // Current RMB message valid flag
 static bool rmbEverActive = false;           // Indicates if RMB was received since boot
-static int32_t rmb_lat = 0;                  // Target latitude from RMB (1e7 deg)  
+static int32_t rmb_lat = 0;                  // Target latitude from RMB (1e7 deg)
 static int32_t rmb_lon = 0;                  // Target longitude from RMB (1e7 deg)
 static uint32_t lastRMBms = 0;               // Timestamp of last parsed RMB sentence
 static char prevDestWpId[13] = "";           // ID of previous destination WP
@@ -1201,7 +1201,12 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
             lastLoiterResetDestId[sizeof(lastLoiterResetDestId) - 1] = '\0';
             gotoLoiterReset(BC_LOITER_WP_RESET_RMB);
 #if DEBUG_GUIDED || DEBUG_APPROACH || DEBUG_SURVEY
-            sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER wp reset"));
+            if (!contourTrigger)
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER wp reset (no trg)"));
+            else if (!haveDPT)
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER wp reset (no DPT)"));
+            else
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER wp reset (no VTGcog)"));
 #endif
         }
     }
