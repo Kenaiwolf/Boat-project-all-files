@@ -50,6 +50,14 @@ bool Mode::enter()
         // clear sailboat tacking flags
         g2.sailboat.clear_tack();
 
+        // per-session throttle/steering state: do not carry stale values
+        // across a mode re-entry. the 75ms heading window and the
+        // coast-sampler inputs are re-written every calc_throttle tick
+        // anyway; clearing them here just removes the one-tick stale read
+        _steering_heading_active_ms = 0;
+        _steer_floor_active = false;
+        _throttle_nav_pct = 0.0f;
+
         // drift handoff: autopilot modes seed from Loiter's estimate
         if (is_autopilot_mode() && (mode_number() != Number::LOITER)) {
             // reset estimator window - no stale window across mode sessions
@@ -340,9 +348,15 @@ void Mode::calc_throttle(float target_speed, bool avoidance_enabled)
     }
 #endif  // AP_AVOIDANCE_ENABLED
 
-    // compute freshness-gated heading error BEFORE the PID calls so the I-term
-    // can be frozen directly via the motor_limit parameters (not via
-    // g2.motors.limit, which is cleared in output() before reaching the PID)
+    // compute freshness-gated heading error BEFORE the PID calls so the
+    // THROTTLE/speed PID I-term can be frozen directly via the motor_limit
+    // parameters (not via g2.motors.limit, which is cleared in output()
+    // before reaching the PID). freezes the throttle integrator below
+    // (get_throttle_out_stop / get_throttle_out_speed), NOT the steering
+    // I-term — the steering-rate PID has its own anti-windup via
+    // limit.steer_left/right in vectored_allocate(). steering I wind-up
+    // protection comes from the steering PID path; this freeze exists
+    // because during a pivot fx~0 would otherwise wind the speed I-term
     bool steer_i_freeze = false;
     float yaw_error_rad = 0.0f;
     float yaw_error_deg = 0.0f;
@@ -387,12 +401,14 @@ void Mode::calc_throttle(float target_speed, bool avoidance_enabled)
     // NOTE: cosine reduction runs on the PID part only - drift-FF is added
     // AFTER it below, otherwise FF would be zeroed exactly at large crab
     // angles where drift-hold needs it most
-    if (g2.motors.have_vectored_thrust() && steering_heading_fresh) {
+    if (g2.motors.have_vectored_thrust() && steering_heading_fresh && !g2.motors.use_vec_fossen()) {
 
         // 1. Cosine Throttle Reduction: reduce forward throttle at large heading error.
         // only scale forward thrust - a negative (braking) PID demand must pass
         // through unchanged, otherwise a heavy boat cannot decelerate during a
         // large heading change
+        // Disabled when VEC_FOSSEN=1: the Fossen allocator (vectored_allocate())
+        // already performs this reduction internally via the polar decomposition
         if (is_positive(throttle_out)) {
             throttle_out *= MAX(0.0f, cosf(yaw_error_rad));
         }
@@ -421,12 +437,26 @@ void Mode::calc_throttle(float target_speed, bool avoidance_enabled)
         }
     }
 
-    if (g2.motors.have_vectored_thrust() && steering_heading_fresh) {
+    // legacy path only: with VEC_FOSSEN=1 the allocator's t_pivot/vec_mag logic
+    // already supplies pivot thrust; stacking this floor on top adds an
+    // unwanted forward bias (see SFL semantics discussion)
+    if (g2.motors.have_vectored_thrust() && !g2.motors.use_vec_fossen() && steering_heading_fresh) {
         // 2. Steering Thrust Floor: force minimum throttle to allow rotation
+        // Disabled when VEC_FOSSEN=1: the Fossen allocator supplies its own
+        // throttle floor via the (Fx,N)->T magnitude, this legacy floor would
+        // double-apply on top of it
         if (yaw_error_deg > g2.motors.get_steer_floor_deadband_deg()) {
-            const float steer_throttle_floor = constrain_float(
+            float steer_throttle_floor = constrain_float(
                 (yaw_error_deg - g2.motors.get_steer_floor_deadband_deg()) * g2.motors.get_steer_floor_gain(),
                 0.0f, g2.motors.get_steer_floor_max_pct());
+            // pivot boost: past the I-freeze threshold the vehicle is rotating
+            // in place anyway, so raise the floor to the dedicated pivot level.
+            // decel limiting (ATC_STR_DECEL_MAX) already shapes the turn rate
+            // demand, this only supplies the thrust to actually achieve it.
+            // 0 disables (stock floor unchanged)
+            if (yaw_error_deg >= g2.motors.get_steer_floor_ifreeze_deg()) {
+                steer_throttle_floor = MAX(steer_throttle_floor, g2.motors.get_steer_floor_pivot_pct());
+            }
             // do not override a throttle that is already stronger than the floor in
             // the same direction; only raise the magnitude, never flip its sign
             if (fabsf(throttle_out) < steer_throttle_floor) {
@@ -472,7 +502,7 @@ bool Mode::stop_vehicle()
     if (!stopped) {
         steering_out = attitude_control.get_steering_out_rate(0.0, g2.motors.limit.steer_left, g2.motors.limit.steer_right, rover.G_Dt);
     }
-    g2.motors.set_steering(steering_out * 4500.0);
+    set_steering(steering_out * 4500.0);
 
     // return true once stopped
     return stopped;
@@ -620,6 +650,9 @@ void Mode::update_drift_estimator(float commanded_heading_cd, float commanded_sp
         _drift_est_last_update_ms = now_ms;
         _drift_est_actual_pos_start_ne_m = current_pos_ne;
         _drift_est_predicted_disp_ne_m.zero();
+        _drift_est_short_start_ms = now_ms;
+        _drift_est_short_pos_start_ne_m = current_pos_ne;
+        _drift_est_short_predicted_disp_ne_m.zero();
         Vector2f pos_shift_ne;
         _drift_est_ekf_reset_ms = ahrs.getLastPosNorthEastReset(pos_shift_ne);
         _drift_est_window_valid = true;
@@ -631,6 +664,8 @@ void Mode::update_drift_estimator(float commanded_heading_cd, float commanded_sp
     if (!gate_ok) {
         _drift_est_window_valid = false;
         _drift_est_window_start_ms = 0;
+        _drift_est_short_start_ms = 0;
+        _drift_est_disagree_streak = 0;
         return;
     }
 
@@ -641,6 +676,8 @@ void Mode::update_drift_estimator(float commanded_heading_cd, float commanded_sp
         ((now_ms - _drift_est_last_update_ms) > DRIFT_EST_MAX_GAP_MS)) {
         _drift_est_window_valid = false;
         _drift_est_window_start_ms = 0;
+        _drift_est_short_start_ms = 0;
+        _drift_est_disagree_streak = 0;
         return;
     }
 
@@ -650,8 +687,54 @@ void Mode::update_drift_estimator(float commanded_heading_cd, float commanded_sp
     const float heading_rad = radians(commanded_heading_cd * 0.01f);
     _drift_est_predicted_disp_ne_m.x += cosf(heading_rad) * commanded_speed_ms * dt;
     _drift_est_predicted_disp_ne_m.y += sinf(heading_rad) * commanded_speed_ms * dt;
+    _drift_est_short_predicted_disp_ne_m.x += cosf(heading_rad) * commanded_speed_ms * dt;
+    _drift_est_short_predicted_disp_ne_m.y += sinf(heading_rad) * commanded_speed_ms * dt;
 
-    // window not finished yet
+    // short window complete: gated write with disagree-streak escalation.
+    // consecutive disagreements mean the environment persistently changed -
+    // step faster (25% then 50%); a single noisy window still only moves 25%.
+    // comparisons run post-gain; the write converts back since
+    // set_nav_estimate_ne() applies the gain itself
+    if ((now_ms - _drift_est_short_start_ms) >= uint32_t(DRIFT_EST_SHORT_WINDOW_S * 1000.0f)) {
+        const Vector2f short_actual_ne_m = (current_pos_ne - _drift_est_short_pos_start_ne_m).tofloat();
+        const float short_window_s = (now_ms - _drift_est_short_start_ms) * 0.001f;
+        const Vector2f drift_short_ms = (short_actual_ne_m - _drift_est_short_predicted_disp_ne_m) / short_window_s;
+
+        const float gain_nav_s = g2.motors.get_drift_comp_gain_nav();
+        Vector2f current_ne_s;
+        uint32_t age_s = 0;
+        bool seeded_s = false;
+        Vector2f to_store_s = drift_short_ms;
+        if (g2.motors.get_nav_estimate_ne(current_ne_s, age_s, seeded_s)) {
+            // gate runs against a seeded value too (post-gain, same domain) -
+            // conservative damping of the first sample after a mode change is
+            // intentional: the freshest post-change window is also the least
+            // trustworthy. unlike the loiter gate, the seed is NOT skipped here
+            // because the nav slot is both source and target of the correction
+            const Vector2f drift_scaled_s = drift_short_ms * gain_nav_s;
+            const float disagree_s = (drift_scaled_s - current_ne_s).length();
+            if (disagree_s > DRIFT_EST_DISAGREE_GATE_MPS) {
+                const float frac = (_drift_est_disagree_streak >= 1) ? 0.5f : 0.25f;
+                _drift_est_disagree_streak = MIN(_drift_est_disagree_streak + 1, 255);
+                to_store_s = (current_ne_s + (drift_scaled_s - current_ne_s) * frac) / MAX(gain_nav_s, 0.01f);
+            } else {
+                _drift_est_disagree_streak = 0;
+            }
+        } else {
+            // empty slot: symmetric with the long window below - a streak must
+            // not prime the next window to step 50% against a first-fill sample
+            // that nothing has validated yet
+            _drift_est_disagree_streak = 0;
+        }
+        g2.motors.set_nav_estimate_ne(to_store_s);
+
+        // restart short window from here
+        _drift_est_short_start_ms = now_ms;
+        _drift_est_short_pos_start_ne_m = current_pos_ne;
+        _drift_est_short_predicted_disp_ne_m.zero();
+    }
+
+    // long window not finished yet
     if ((now_ms - _drift_est_window_start_ms) < uint32_t(DRIFT_EST_WINDOW_S * 1000.0f)) {
         return;
     }
@@ -671,13 +754,25 @@ void Mode::update_drift_estimator(float commanded_heading_cd, float commanded_sp
     Vector2f drift_to_store = drift_ne_ms;
     uint32_t unused_age_ms = 0;
     bool unused_is_seeded = false;
+    const float gain_nav = g2.motors.get_drift_comp_gain_nav();
+    // compare in post-gain domain: current_ne already has DRIFT_GAIN_NAV applied
     if (g2.motors.get_nav_estimate_ne(current_ne, unused_age_ms, unused_is_seeded)) {
-        const float disagreement = (drift_ne_ms - current_ne).length();
+        const Vector2f drift_scaled = drift_ne_ms * gain_nav;
+        const float disagreement = (drift_scaled - current_ne).length();
         if (disagreement > DRIFT_EST_DISAGREE_GATE_MPS) {
             // don't discard outright - the environment may genuinely have changed -
-            // but only move a fraction of the way towards the new sample this time
-            drift_to_store = current_ne + (drift_ne_ms - current_ne) * 0.25f;
+            // but only move a fraction of the way towards the new sample this time.
+            // a disagreeing long-window sample also primes the streak so the next
+            // short-window sample already steps at 50%
+            _drift_est_disagree_streak = MIN(_drift_est_disagree_streak + 1, 255);
+            drift_to_store = (current_ne + (drift_scaled - current_ne) * 0.25f) / MAX(gain_nav, 0.01f);
+        } else {
+            _drift_est_disagree_streak = 0;
         }
+    } else {
+        // empty slot: nothing to disagree with, streak must not survive a
+        // first-fill window
+        _drift_est_disagree_streak = 0;
     }
 
     // gain (DRIFT_GAIN_NAV) is already applied inside set_nav_estimate_ne()
@@ -826,7 +921,7 @@ void Mode::calc_steering_to_heading(float desired_heading_cd, float rate_max_deg
 void Mode::set_steering(float steering_value)
 {
     if (allows_stick_mixing() && g2.stick_mixing > 0) {
-        steering_value = channel_steer->stick_mixing((int16_t)steering_value);
+        steering_value = channel_steer->stick_mixing((int16_t)constrain_float(steering_value, -4500.0f, 4500.0f));
     }
     g2.motors.set_steering(steering_value);
 }

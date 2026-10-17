@@ -90,29 +90,43 @@ public:
     // true if vehicle is capable of skid steering
     bool have_skid_steering() const;
 
-    // true if vehicle has vectored thrust (i.e. boat with motor on steering servo)  
+    // true if vehicle has vectored thrust (i.e. boat with motor on steering servo)
     bool have_vectored_thrust() const { return is_positive(_vector_angle_max); }
-    float get_vector_angle_max() const { return _vector_angle_max; }	
-  
-    // steering-floor / loiter-drift tunable getters (used by Mode::calc_throttle and ModeLoiter)  
-    float get_steer_floor_deadband_deg() const { return _sfl_deadband_deg; }  
-    float get_steer_floor_gain()             const { return _sfl_gain; }  
-    float get_steer_floor_max_pct()          const { return _sfl_max_pct; }  
-    float get_steer_floor_ifreeze_deg()      const { return _sfl_ifreeze_deg; }  
-    float get_loit_drift_min_mps()           const { return _loit_drift_min; }  
-    float get_loit_coast_thr_pct()           const { return _loit_coast_thr; }  
-    float get_loit_i_eq_err_mps()            const { return _loit_i_eq_err; }  
-    float get_loit_i_min()                   const { return _loit_i_min; }  
-    float get_loit_i_alpha()                 const { return _loit_i_alpha; }  
-    float get_loit_i_disagree()              const { return _loit_i_disagree; }  
-    float get_loit_rot_ang_deg()             const { return _loit_rot_ang_deg; }  
-    float get_loit_rot_rate_dps()            const { return _loit_rot_rate_dps; }  
+    float get_vector_angle_max() const { return _vector_angle_max; }
+
+    // steering-floor / loiter-drift tunable getters (used by Mode::calc_throttle and ModeLoiter)
+    bool get_vec_fossen() const { return _vec_fossen > 0; }
+    float get_steer_floor_deadband_deg() const { return _sfl_deadband_deg; }
+    float get_steer_floor_gain()             const { return _sfl_gain; }
+    float get_steer_floor_max_pct()          const { return _sfl_max_pct; }
+    float get_steer_floor_ifreeze_deg()      const { return _sfl_ifreeze_deg; }
+    float get_steer_floor_pivot_pct()        const { return _sfl_pivot_pct; }
+    float get_loit_drift_min_mps()           const { return _loit_drift_min; }
+    float get_loit_coast_thr_pct()           const { return _loit_coast_thr; }
+    float get_loit_i_eq_err_mps()            const { return _loit_i_eq_err; }
+    float get_loit_i_min()                   const { return _loit_i_min; }
+
+    // clamp at read-time: @Range is GCS metadata only - a param set outside
+    // [0,1] via mavlink/param-file would make the loiter EMA diverge
+    float get_loit_i_alpha()                 const { return constrain_float(_loit_i_alpha, 0.0f, 1.0f); }
+    float get_loit_i_disagree()              const { return _loit_i_disagree; }
+    float get_loit_rot_ang_deg()             const { return _loit_rot_ang_deg; }
+    float get_loit_rot_rate_dps()            const { return _loit_rot_rate_dps; }
     float get_drift_est_yaw_rate_dps()       const { return _drift_est_yaw_rate_dps; }
-    // last commanded vectored-thrust steering angle (rad). 0 when vectored  
-    // thrust is disabled. used by loiter method-1 gating: a deflected  
-    // thruster rotates the hull, and rotation about the ~0.6m pivot radius  
-    // produces lateral IMU velocity that would be misread as drift  
+
+	// last commanded vectored-thrust steering angle (rad). 0 when vectored
+    // thrust is disabled. used by loiter method-1 gating: a deflected
+    // thruster rotates the hull, and rotation about the ~0.6m pivot radius
+    // produces lateral IMU velocity that would be misread as drift
     float get_vectored_angle_rad()         const { return have_vectored_thrust() ? _vec_last_steering_angle_rad : 0.0f; }
+
+    // true while the servo-transit suppression window is active (throttle is
+    // being forced to zero pending servo traversal of +-90deg). loiter drift
+    // sampling gates on this - a sample taken mid-transit is not drift
+    bool is_in_servo_transit() const {
+        return _vec_pivot_coast_ms != 0 && _vec_transit_ms > 0 &&
+               (AP_HAL::millis() - _vec_pivot_coast_ms) < (uint32_t)_vec_transit_ms.get();
+    }
 
     // set an externally-measured wind+current drift estimate (m/s, North/East), one
     // independent slot per acquisition method.  the per-source gain (DRIFT_GAIN_LOIT /
@@ -120,7 +134,8 @@ public:
     // get_current_estimate_ne() below is already the final, PID-ready corrected vector --
     // Mode::apply_drift_compensation()/calc_throttle() must NOT apply any further gain to it.
     void set_loiter_estimate_ne(const Vector2f &drift_ne);
-    void set_nav_estimate_ne(const Vector2f &drift_ne);
+    // Guided/nav-mode sourced drift estimate (m/s NE); DRIFT_GAIN_NAV applied inside
+	void set_nav_estimate_ne(const Vector2f &drift_ne);
 
     // seed the opposite-mode slot directly with an already-calibrated value
     // (e.g. handoff at mode entry) - unlike set_loiter/nav_estimate_ne(),
@@ -147,6 +162,22 @@ public:
     // shared staleness cutoff (s) common to both sources - exposed so mode
     // code can compute its own age-based handoff weighting
     float get_drift_max_age_s() const { return _drift_max_age_s; }
+
+    // per-source calibration gains, read-time constrained to the same range
+    // the setters use - needed by mode code to compare new raw samples against
+    // the stored post-gain estimate in the same domain
+    float get_drift_comp_gain_loiter() const { return constrain_float(_drift_comp_gain_loiter, 0.0f, 2.0f); }
+    float get_drift_comp_gain_nav()    const { return constrain_float(_drift_comp_gain_nav, 0.0f, 2.0f); }
+
+    // post-gain decay of the loiter slot - multiplies the STORED value
+    // directly (no gain round-trip through the setter). refreshes the
+    // timestamp on purpose: a decayed value is a live "measured zero"
+    // sample, not a stale placeholder
+    void decay_loiter_estimate(float factor);
+
+    // true when the unified allocator (VEC_FOSSEN=1) handles vectored thrust;
+    // mode-level legacy patches (e.g. steering floor) must not run on top of it
+    bool use_vec_fossen() const { return _vec_fossen > 0; }
 
     // output to motors and steering servos
     // ground_speed should be the vehicle's speed over the surface in m/s
@@ -221,6 +252,12 @@ private:
     // output to regular steering and throttle channels
     void output_regular(bool armed, float ground_speed, float steering, float throttle, float dt);
 
+    // unified vectored-thrust allocator (VEC_FOSSEN=1): maps desired surge force
+    // fx_req and yaw moment n_req (both normalised -1..1) to steering centidegrees
+    // and throttle percent; runs unconditionally wherever the allocator runs
+    void vectored_allocate(float fx_req, float n_req, float ground_speed,
+                           float &steering_cd, float &throttle_pct, float dt);
+
     // output to skid steering channels
     void output_skid_steering(bool armed, float steering, float throttle, float dt);
 
@@ -278,25 +315,25 @@ private:
     AP_Float _batt_power_time_constant;    // Time constant used to limit the battery power
     AP_Float _vec_deadband;    // deadband on total commanded steering/throttle vector magnitude below which the vectored-thrust angle is frozen instead of recalculated, suppressing atan() noise amplification near zero throttle
     AP_Float _vec_blend_thr;   // filtered throttle (normalised 0~1) below which vectored-thrust steering angle is computed directly/proportionally from steering demand instead of atan(steering/throttle)
-    AP_Float _vec_resid_tc;    // time constant (s) of the low-pass filter applied to throttle before it is used to select/blend the vectored-thrust regime  
-  
-    // steering-to-throttle floor tunables (vectored-thrust runaway prevention)  
-    AP_Float _sfl_deadband_deg;    // heading error (deg) below which no floor throttle is injected  
-    AP_Float _sfl_gain;            // floor throttle % per degree of error above deadband  
-    AP_Float _sfl_max_pct;         // maximum floor throttle (%)  
-    AP_Float _sfl_ifreeze_deg;     // heading error (deg) above which speed-PID I-term is frozen  
-    // loiter drift-estimation tunables  
-    AP_Float _loit_drift_min;      // minimum drift magnitude (m/s) to activate anti-drift heading in loiter  
-    AP_Float _loit_coast_thr;      // pre-floor throttle demand (%) below which the vehicle is considered coasting  
-    AP_Float _loit_i_eq_err;       // speed-PID error (m/s) below which I-term is at drift equilibrium  
-    AP_Float _loit_i_min;          // minimum I-term magnitude (0-1) accepted as a drift sample  
-    AP_Float _loit_i_alpha;        // EMA alpha for I-term magnitude filtering  
+    AP_Float _vec_resid_tc;    // time constant (s) of the low-pass filter applied to throttle before it is used to select/blend the vectored-thrust regime
+
+    // steering-to-throttle floor tunables (vectored-thrust runaway prevention)
+    AP_Float _sfl_deadband_deg;    // heading error (deg) below which no floor throttle is injected
+    AP_Float _sfl_gain;            // floor throttle % per degree of error above deadband
+    AP_Float _sfl_max_pct;         // maximum floor throttle (%)
+    AP_Float _sfl_ifreeze_deg;     // heading error (deg) above which speed-PID I-term is frozen
+    // loiter drift-estimation tunables
+    AP_Float _loit_drift_min;      // minimum drift magnitude (m/s) to activate anti-drift heading in loiter
+    AP_Float _loit_coast_thr;      // pre-floor throttle demand (%) below which the vehicle is considered coasting
+    AP_Float _loit_i_eq_err;       // speed-PID error (m/s) below which I-term is at drift equilibrium
+    AP_Float _loit_i_min;          // minimum I-term magnitude (0-1) accepted as a drift sample
+    AP_Float _loit_i_alpha;        // EMA alpha for I-term magnitude filtering
     AP_Float _loit_i_disagree;     // fraction by which a new sample may differ before being down-weighted to 25%
     AP_Float _drift_comp_gain_loiter;  // gain applied to a Loiter-sourced drift sample at the moment it is written via set_loiter_estimate_ne().  zero to disable that source entirely
     AP_Float _drift_comp_gain_nav;  // gain applied to nav-sourced drift sample at write-time via set_nav_estimate_ne(). zero disables this source
-    AP_Float _drift_max_age_s;   // shared staleness cutoff (s) common to both sources: if neither has been updated within this many seconds, get_current_estimate_ne() returns false (correction fully off).  e.g. 1800 = 30min  
-    AP_Float _loit_rot_ang_deg;      // vectored-thruster deflection (deg) above which loiter method-1 coast sampling is blocked - rotation about the pivot produces lateral velocity that would be misread as drift  
-    AP_Float _loit_rot_rate_dps;     // yaw rate (deg/s) above which loiter method-1 coast sampling is blocked  
+    AP_Float _drift_max_age_s;   // shared staleness cutoff (s) common to both sources: if neither has been updated within this many seconds, get_current_estimate_ne() returns false (correction fully off).  e.g. 1800 = 30min
+    AP_Float _loit_rot_ang_deg;      // vectored-thruster deflection (deg) above which loiter method-1 coast sampling is blocked - rotation about the pivot produces lateral velocity that would be misread as drift
+    AP_Float _loit_rot_rate_dps;     // yaw rate (deg/s) above which loiter method-1 coast sampling is blocked
     AP_Float _drift_est_yaw_rate_dps; // yaw rate (deg/s) above which the shared nav drift-estimator window is invalidated
 
     // internal variables
@@ -309,6 +346,21 @@ private:
 	float   _vec_steering_filt;   // low-pass filtered steering_norm, same time constant as _vec_throttle_filt
     float   _vec_last_steering_angle_rad; // last commanded vectored-thrust steering angle (rad), held during deadband
     float   _vec_last_w;                  // last blend weight (w), held during deadband so throttle boost stays consistent
+    bool    _vec_rot_brake_active = false; // true while rotation-brake angle-lock (Option B) is holding steering_angle_rad fixed against atan2/direct-angle recompute and the steering PID
+    float   _vec_rot_brake_angle_rad = 0.0f; // steering angle (rad) locked in at the instant _vec_rot_brake_active was set true
+    uint32_t _vec_pivot_coast_ms = 0;     // millis() timestamp of last yaw-agreement brake release; nonzero = post-release transit suppression active
+    bool    _vec_folded = false;          // fold hysteresis state: true while the atan2 demand is folded past +/-90deg, prevents chatter at the fold boundary
+    AP_Int8 _vec_fossen;                  // VEC_FOSSEN: 0 = stock vectored blend + SFL floor/cosine reduction active, 1 = Fossen unified allocator (floor/cosine reduction auto-disabled)
+    AP_Float _sfl_pivot_pct;              // SFL_PIVOT: raised floor throttle while yaw error >= SFL_IFRZ
+    AP_Float _vec_brk_pct;                // VEC_BRK: rotation-brake reverse thrust scale (%), 0 disables
+    AP_Float _vec_yaw_lin_expo;           // VEC_YAW_EXP: inverse-exponent linearization of yaw-dominant throttle demand, 1.0=off
+    AP_Float _vec_brk_asym;               // VEC_BRK_ASYM: braking-demand multiplier (reverse thrust less efficient than forward), 1.0=off
+    AP_Float _vec_cos_flr_deg;            // VEC_COS_FLR: angular margin (deg) from 90 deg mechanical stop where cos(delta) floor engages, 0=legacy hard threshold
+	AP_Float _vec_bld_strt_deg;           // VEC_BLD_STRT: steering angle (deg) below which throttle is pure geometric decomposition
+    AP_Float _yaw_crs_rate_dps;           // YAW_CRS_RATE: reference yaw rate (deg/s) for pivot throttle calibration
+    AP_Float _yaw_crs_thr_pct;            // YAW_CRS_THR: throttle (%) required to sustain YAW_CRS_RATE in pivot mode
+    AP_Int16 _vec_transit_ms;             // VEC_TRN_MS: servo-transit throttle suppression window (ms), 0 disables
+    uint8_t _vec_rot_brake_cnt = 0;       // consecutive opposing-yaw ticks for brake debounce (noise hysteresis)
     Vector2f _loiter_estimate_ne;           // Loiter-sourced drift estimate (m/s NE), gain applied
     uint32_t _loiter_estimate_ms;           // ms _loiter_estimate_ne last updated; 0=never
     Vector2f _nav_estimate_ne;           // Guided-sourced drift estimate (m/s, NE), gain applied
@@ -335,8 +387,8 @@ private:
       3 reversal handling structures, for k_throttle, k_throttleLeft and k_throttleRight
      */
     struct ReverseThrottle {
-        float last_throttle;
-        uint32_t last_output_ms;
+        float last_throttle = 0.0f;
+        uint32_t last_output_ms = 0;
 
         // output with delay for reversal
         void output(SRV_Channel::Function function, float throttle, float delay);
