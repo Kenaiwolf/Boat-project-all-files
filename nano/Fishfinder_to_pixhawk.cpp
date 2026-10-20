@@ -95,15 +95,25 @@ static mavlink_message_t mavMsg;
 // Contour following tuning parameters
 #define CONTOUR_CIRCLE_RADIUS_M 3.0f
 #define CONTOUR_MIN_TURN_RADIUS_M 1.0f
-#define CONTOUR_CORRECT_DEPTH_M 0.15f
 #define CONTOUR_SAFETY_DEPTH_M 0.8f
-#define CONTOUR_GAIN_DEG_PER_M 80.0f
 #define CONTOUR_MAX_OFFSET_DEG 90.0f
-#define CONTOUR_TREND_DIST_M 4.0f
-#define CONTOUR_FLIP_ABORT_M 0.5f
-#define CONTOUR_LOST_TIMEOUT_MS 50000UL
-#define CONTOUR_FLIP_GATE_MS 3000UL
-#define CONTOUR_LOST_DIST_M (CONTOUR_CIRCLE_RADIUS_M * 4)
+#define FOLLOW_K_LAT 0.5f
+#define FOLLOW_SLOPE_MIN 0.02f
+#define DEPTH_FLAT_M 0.05f
+#define SLOPE_MIN_PERP_M 0.25f
+#define SLOPE_UPD_MIN_DIST_M 1.0f
+#define SLOPE_DEPTH_MIN_M 0.05f
+#define SLOPE_EMA 0.3f
+#define SLOPE_DECAY 0.7f
+#define DITHER_DEPTH_M 0.5f
+#define DITHER_PERIOD_M 12.0f
+#define DITHER_MAX_LAT_M 15.0f
+#define DITHER_MAX_OFF_DEG 25.0f
+#define CROSS_DEBOUNCE_M 2.0f
+#define CROSS_LOST_DIST_M 20.0f
+#define TICK_DIST_MAX_M 5.0f
+#define FOLLOW_UNCERTAIN_CORR_DEG 20.0f
+#define LEVER_ARM_M 1.865f
 
 // Operational delays and global scaling factors
 #define LOITER_RESET_MS 1500UL
@@ -116,9 +126,6 @@ static mavlink_message_t mavMsg;
 // Circular surveying and trajectory correction gains
 #define CIRCLE_RADIUS_GAIN 5.0f
 #define CIRCLE_RADIUS_MAX_CORR_DEG 45.0f
-#define TREND_NUDGE_GAIN 5.0f
-#define TREND_NUDGE_MAX_DEG 25.0f
-#define TREND_DEPTH_MIN_M 0.05f
 
 // Speed command thresholds and resend delays
 #define SPEED_RESEND_THRESHOLD_MS 0.005f
@@ -281,14 +288,24 @@ static int16_t depthSlopeBufDist[DEPTH_SLOPE_SAMPLES];
 static uint8_t depthSlopeHead = 0;
 static uint8_t depthSlopeCount = 0;
 static float depthSlopeCumDist = 0.0f;
-static float followPrevError_m = 0.0f;
-static uint32_t lastSideFlipMs = 0;
-static bool contourTrendRefSet = false;
 static bool contourHoldTargetSent = false;
-static int32_t contourTrendRefLat_int = 0;
-static int32_t contourTrendRefLon_int = 0;
-static float contourTrendRefDepth = 0.0f;
-static float contourTrendRefCosLat = 1.0f;
+static float followSlope = 0.0f;
+static bool followSlopeValid = false;
+static float circleBestSlope = 0.0f;
+static float circleMinDepth = 0.0f;
+static float circleMaxDepth = 0.0f;
+static float crossDistAcc = 0.0f;
+static float crossSinceLast_m = 0.0f;
+static float excitAccum_m = 0.0f;
+static bool wasBelowTarget = false;
+static float ditherPhaseRad = 0.0f;
+static float eLatPrev_m = 0.0f;                 // reserved for D-term
+static int32_t prevPosLat_int = 0;
+static int32_t prevPosLon_int = 0;
+static int32_t slopePrevLat_int = 0;
+static int32_t slopePrevLon_int = 0;
+static float slopePrevDepth = 0.0f;
+static float slopePrevOffsetDeg = 0.0f;
 static bool depthLost = false;
 #define CONTOUR_DPT_LOSS_MS 4000UL
 static int32_t contourHoldLat_int = 0;
@@ -965,10 +982,16 @@ static void setCircleAnchor(float lat, int32_t lat_int, int32_t lon_int, float h
     depthSlopeHead = 0;
     depthSlopeCount = 0;
     depthSlopeCumDist = 0.0f;
-    contourTrendRefSet = false;
-    followPrevError_m = 0.0f;
     lastContourOffsetDeg = 0.0f;
     contourLastGoodMs = millis();
+    followSlopeValid = false;
+    circleBestSlope = 0.0f;
+    circleMinDepth = circleMaxDepth = depth_m;
+    crossDistAcc = 0.0f;
+    crossSinceLast_m = 0.0f;
+    excitAccum_m = 0.0f;
+    ditherPhaseRad = 0.0f;
+    eLatPrev_m = 0.0f;
 
 #if DEBUG_FREE_RAM
     checkFreeRam('G');
@@ -1014,6 +1037,13 @@ static void enterContourFollow() {
     snprintf(activMsg, sizeof(activMsg), "CONTOUR FOLLOW: activated %sm", depthStr);
     sendStatusText(MAV_SEVERITY_INFO, activMsg);
 #endif
+}
+
+// Returns estimated transducer position: 1.865 m aft of Pixhawk along heading (starboard 30 mm ignored)
+static void transducerPos(int32_t &lat_out, int32_t &lon_out) {
+    float hRad = (havePixhawkHeading ? pixhawkHeadingDeg : contourHeadingDeg) * (float)M_PI / 180.0f;
+    lat_out = currentLat_int - (int32_t)(LEVER_ARM_M * cosf(hRad) * INT7_PER_METER_LAT);
+    lon_out = currentLon_int - (int32_t)(LEVER_ARM_M * sinf(hRad) * INT7_PER_METER_LAT / activationCosLat);
 }
 
 // Recalibrates geometry when contour tracking was temporarily lost and the system reverts to survey mode
@@ -1300,6 +1330,18 @@ static void handleContourDepthLossRecovery(uint32_t now) {
 #endif
     } else if (!dptStaleNow && depthLost) {
         depthLost = false;
+        followSlopeValid = false;
+        crossDistAcc = 0.0f;
+        crossSinceLast_m = 0.0f;
+        excitAccum_m = 0.0f;
+        if (haveCurrentPos) {
+            int32_t tLat, tLon;
+            transducerPos(tLat, tLon);
+            prevPosLat_int = tLat; prevPosLon_int = tLon;
+            slopePrevLat_int = tLat; slopePrevLon_int = tLon;
+            slopePrevOffsetDeg = lastContourOffsetDeg;
+            if (haveDPT) slopePrevDepth = depth_m;
+        }
         if (contourPhase == ContourPhase::CIRCLE_SURVEY) {
             contourPhase = ContourPhase::CIRCLE_APPROACH;
         }
@@ -1353,10 +1395,12 @@ static void handleContourApproachPhase(uint32_t now) {
             circleAccumAngle = 0.0f;
             circleCrossFound = false;
             circleBestDev = 999.0f;
+            circleBestSlope = 0.0f;
             depthSlopeCount = 0;
             depthSlopeHead = 0;
             depthSlopeCumDist = 0.0f;
             circleLastDepth = haveDPT ? depth_m : contourTargetDepth_m;
+            circleMinDepth = circleMaxDepth = circleLastDepth;
             surveyDptWasValid = haveDPT;
             circleApproachSampled = false;
             contourPhase = ContourPhase::CIRCLE_SURVEY;
@@ -1419,6 +1463,11 @@ static void handleContourSurveyPhase(uint32_t now) {
             depthSlopeBufDist[depthSlopeHead] = (int16_t)(depthSlopeCumDist * 100.0f);
             depthSlopeHead = (depthSlopeHead + 1) % DEPTH_SLOPE_SAMPLES;
             if (depthSlopeCount < DEPTH_SLOPE_SAMPLES) depthSlopeCount++;
+            if (depthSlopeCount <= 1) { circleMinDepth = circleMaxDepth = depth_m; }
+            else {
+                if (depth_m < circleMinDepth) circleMinDepth = depth_m;
+                if (depth_m > circleMaxDepth) circleMaxDepth = depth_m;
+            }
 
             float prevErr = circleLastDepth - contourTargetDepth_m;
             float currErr = depth_m - contourTargetDepth_m;
@@ -1427,6 +1476,7 @@ static void handleContourSurveyPhase(uint32_t now) {
 
             if (crossed) {
                 bool deepSide = false, deepSideValid = false;
+                float crossSlope = 0.0f;
                 if (depthSlopeCount >= 2) {
                     uint8_t oldIdx = (depthSlopeHead + DEPTH_SLOPE_SAMPLES - depthSlopeCount) % DEPTH_SLOPE_SAMPLES;
                     float distSpan = depthSlopeCumDist - (depthSlopeBufDist[oldIdx] * 0.01f);
@@ -1434,6 +1484,7 @@ static void handleContourSurveyPhase(uint32_t now) {
                         float slope = (depth_m - (depthSlopeBufDepth[oldIdx] * 0.01f)) / distSpan;
                         deepSideValid = fabsf(slope) >= DEPTH_SLOPE_CONF_THR;
                         deepSide = (slope > 0.0f);
+                        crossSlope = slope;
                     }
                 }
 #if DEBUG_CONTOUR_TUNING
@@ -1478,7 +1529,8 @@ static void handleContourSurveyPhase(uint32_t now) {
                             circleBestLat_int = crossLat_int;
                             circleBestLon_int = crossLon_int;
                             circleCrossFound = true;
-                            acceptedA = true;
+                            circleBestSlope = fabsf(crossSlope);
+                            acceptedB = true;
                         }
                     } else {
                         if (devB < circleBestDev) {
@@ -1488,7 +1540,8 @@ static void handleContourSurveyPhase(uint32_t now) {
                             circleBestLat_int = crossLat_int;
                             circleBestLon_int = crossLon_int;
                             circleCrossFound = true;
-                            acceptedB = true;
+                            circleBestSlope = fabsf(crossSlope);
+                            acceptedA = true;
                         }
                     }
 #if DEBUG_CONTOUR_TUNING
@@ -1527,11 +1580,33 @@ static void handleContourSurveyPhase(uint32_t now) {
                 contourBaseHeadingDeg = circleBestHeading;
                 contourHeadingDeg = circleBestHeading;
                 contourKpSigned = circleBestDeepRight ? 1.0f : -1.0f;
-                followPrevError_m = contourTargetDepth_m - (haveDPT ? depth_m : contourTargetDepth_m);
-                contourTrendRefSet = false;
 
-                contourLastGoodLat_int = haveCurrentPos ? currentLat_int : circleBestLat_int;
-                contourLastGoodLon_int = haveCurrentPos ? currentLon_int : circleBestLon_int;
+                float gradEst = circleBestSlope;
+                float minmaxEst = (circleMaxDepth - circleMinDepth) / (2.0f * CONTOUR_CIRCLE_RADIUS_M);
+                if (minmaxEst > gradEst) gradEst = minmaxEst;
+                followSlope = gradEst;
+                followSlopeValid = (followSlope >= FOLLOW_SLOPE_MIN);
+
+                int32_t tLat, tLon;
+                if (haveCurrentPos) {
+                    transducerPos(tLat, tLon);
+                } else {
+                    tLat = circleBestLat_int;
+                    tLon = circleBestLon_int;
+                }
+                slopePrevLat_int = prevPosLat_int = tLat;
+                slopePrevLon_int = prevPosLon_int = tLon;
+                slopePrevDepth = depth_m;
+                slopePrevOffsetDeg = 0.0f;
+                crossDistAcc = 0.0f;
+                crossSinceLast_m = 0.0f;
+                excitAccum_m = 0.0f;
+                ditherPhaseRad = 0.0f;
+                eLatPrev_m = 0.0f;
+                wasBelowTarget = (depth_m > contourTargetDepth_m);
+
+                contourLastGoodLat_int = tLat;
+                contourLastGoodLon_int = tLon;
                 contourLastGoodHeadingDeg = circleBestHeading;
                 contourLastGoodMs = millis();
                 contourLastGoodValid = true;
@@ -1576,21 +1651,107 @@ static void handleContourFollowPhase(uint32_t now) {
 #if DEBUG_BREADCRUMB
         EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_FOLLOW_LOOP_TOP);
 #endif
-        if (haveDPT) {
-            float error = contourTargetDepth_m - depth_m;
-            // Instability flip abort logic – detects sharp deviations rendering current side bias obsolete
-            if (fabsf(error) - fabsf(followPrevError_m) > CONTOUR_FLIP_ABORT_M && (now - lastSideFlipMs) >= CONTOUR_FLIP_GATE_MS) {
-                contourKpSigned = -contourKpSigned;
-                contourBaseHeadingDeg = contourHeadingDeg - lastContourOffsetDeg;
-                lastSideFlipMs = now;
+        if (haveDPT && haveCurrentPos) {
+            int32_t tLat, tLon;
+            transducerPos(tLat, tLon);
+
+            // --- per-tick distance (transducer frame) ---
+            float dNt = (tLat - prevPosLat_int) * METERS_PER_INT7_LAT;
+            float dEt = (tLon - prevPosLon_int) * METERS_PER_INT7_LAT * activationCosLat;
+            float tickDist = sqrtf(dNt * dNt + dEt * dEt);
+            if (tickDist > TICK_DIST_MAX_M) tickDist = TICK_DIST_MAX_M;
+            prevPosLat_int = tLat;
+            prevPosLon_int = tLon;
+
+            // --- slope estimator update + decay ---
+            float dNs = (tLat - slopePrevLat_int) * METERS_PER_INT7_LAT;
+            float dEs = (tLon - slopePrevLon_int) * METERS_PER_INT7_LAT * activationCosLat;
+            float dist = sqrtf(dNs * dNs + dEs * dEs);
+            if (dist >= SLOPE_UPD_MIN_DIST_M) {
+                float dPerp = dist * sinf(fabsf(slopePrevOffsetDeg) * (float)M_PI / 180.0f);
+                float dd = depth_m - slopePrevDepth;
+                if (fabsf(dd) >= SLOPE_DEPTH_MIN_M && dPerp >= SLOPE_MIN_PERP_M) {
+                    float gMeas = fabsf(dd) / dPerp;
+                    followSlope = SLOPE_EMA * gMeas + (1.0f - SLOPE_EMA) * followSlope;
+                    followSlopeValid = (followSlope >= FOLLOW_SLOPE_MIN);
+                    excitAccum_m = 0.0f;
 #if DEBUG_FOLLOW
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("CONTOUR: side flip"));
+                    sendStatusText_P(MAV_SEVERITY_DEBUG, PSTR("g_meas updated"));
+#endif
+                } else {
+                    excitAccum_m += dist;
+                    if (excitAccum_m >= DITHER_PERIOD_M) {
+                        followSlope *= SLOPE_DECAY;
+                        followSlopeValid = (followSlope >= FOLLOW_SLOPE_MIN);
+                        excitAccum_m = 0.0f;
+#if DEBUG_FOLLOW
+                        sendStatusText_P(MAV_SEVERITY_DEBUG, PSTR("SLOPE decay"));
+#endif
+                    }
+                }
+                slopePrevLat_int = tLat;
+                slopePrevLon_int = tLon;
+                slopePrevDepth = depth_m;
+                slopePrevOffsetDeg = lastContourOffsetDeg;
+            }
+
+            float error = contourTargetDepth_m - depth_m;
+
+            // --- adaptive dither: amplitude tied to target depth excitation ---
+            float g = (followSlopeValid && followSlope >= FOLLOW_SLOPE_MIN) ? followSlope : FOLLOW_SLOPE_MIN;
+            float latAmpRaw = DITHER_DEPTH_M / g;
+            bool slopeTooFlat = (latAmpRaw > DITHER_MAX_LAT_M);
+            float latAmp = slopeTooFlat ? DITHER_MAX_LAT_M : latAmpRaw;
+            if (slopeTooFlat) followSlopeValid = false;
+            float offAmp = latAmp * 57.29577951f;
+            if (offAmp > DITHER_MAX_OFF_DEG) offAmp = DITHER_MAX_OFF_DEG;
+            ditherPhaseRad += tickDist * 6.2831853f / DITHER_PERIOD_M;
+            if (ditherPhaseRad >= 6.2831853f) ditherPhaseRad -= 6.2831853f;
+
+            // --- crossing detection: unconditional accumulation, debounced accept ---
+            crossDistAcc += tickDist;
+            crossSinceLast_m += tickDist;
+            bool nowBelow = (error < 0.0f);
+            if (nowBelow != wasBelowTarget && crossSinceLast_m >= CROSS_DEBOUNCE_M) {
+                wasBelowTarget = nowBelow;
+                crossSinceLast_m = 0.0f;
+                crossDistAcc = 0.0f;
+                if (haveVTGcog) {
+                    float dh = vtg_cog_deg - contourBaseHeadingDeg;
+                    while (dh > 180.0f) dh -= 360.0f;
+                    while (dh < -180.0f) dh += 360.0f;
+                    contourBaseHeadingDeg += 0.5f * dh;
+                    while (contourBaseHeadingDeg < 0.0f) contourBaseHeadingDeg += 360.0f;
+                    while (contourBaseHeadingDeg >= 360.0f) contourBaseHeadingDeg -= 360.0f;
+                }
+                contourLastGoodLat_int = tLat;
+                contourLastGoodLon_int = tLon;
+                contourLastGoodHeadingDeg = contourHeadingDeg;
+                contourLastGoodValid = true;
+                contourLastGoodMs = now;
+#if DEBUG_FOLLOW
+                sendStatusText_P(MAV_SEVERITY_DEBUG, PSTR("CROSS"));
 #endif
             }
-            followPrevError_m = error;
 
-            // Proportional offset calculation pushing heading vector toward target depth
-            float offset = contourKpSigned * CONTOUR_GAIN_DEG_PER_M * error;
+            // --- lost detection: no accepted crossing within distance budget ---
+            if (crossDistAcc >= CROSS_LOST_DIST_M) {
+#if DEBUG_BREADCRUMB
+                EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_FOLLOW_REENTER);
+#endif
+                reenterContourFromLastGood();
+                sendVelocityTarget(contourHeadingDeg, fishingSpeed);
+                return;
+            }
+
+            // --- lateral error in meters + atan-bounded correction ---
+            float eLat = (fabsf(error) < DEPTH_FLAT_M) ? 0.0f : (error / g);
+            float corr = atanf(FOLLOW_K_LAT * eLat) * 57.29577951f;
+            float corrCap = followSlopeValid ? CONTOUR_MAX_OFFSET_DEG : FOLLOW_UNCERTAIN_CORR_DEG;
+            if (corr > corrCap) corr = corrCap;
+            if (corr < -corrCap) corr = -corrCap;
+
+            float offset = contourKpSigned * corr + offAmp * sinf(ditherPhaseRad);
             if (offset > CONTOUR_MAX_OFFSET_DEG) offset = CONTOUR_MAX_OFFSET_DEG;
             if (offset < -CONTOUR_MAX_OFFSET_DEG) offset = -CONTOUR_MAX_OFFSET_DEG;
 
@@ -1603,59 +1764,7 @@ static void handleContourFollowPhase(uint32_t now) {
 #if DEBUG_BREADCRUMB
             EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_FOLLOW_HEADING_DONE);
 #endif
-            bool nowInGood = fabsf(error) <= CONTOUR_CORRECT_DEPTH_M;
-
-            if (nowInGood && haveCurrentPos) {
-                contourLastGoodLat_int = currentLat_int;
-                contourLastGoodLon_int = currentLon_int;
-                contourLastGoodHeadingDeg = contourHeadingDeg;
-                contourLastGoodValid = true;
-                contourLastGoodMs = now;
-            }
-
-            if (haveCurrentPos && contourLastGoodValid) {
-                float dNs = (currentLat_int - contourLastGoodLat_int) * METERS_PER_INT7_LAT;
-                float dEs = (currentLon_int - contourLastGoodLon_int) * METERS_PER_INT7_LAT * cosf(currentLat_deg * (float)M_PI / 180.0f);
-                float satDist = sqrtf(dNs * dNs + dEs * dEs);
-
-                // Reverts back to survey mode if line is lost beyond distance or temporal bounds
-                if ((now - contourLastGoodMs) >= CONTOUR_LOST_TIMEOUT_MS || satDist >= CONTOUR_LOST_DIST_M) {
-#if DEBUG_BREADCRUMB
-                    EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_FOLLOW_REENTER);
-#endif
-                    reenterContourFromLastGood();
-                    sendVelocityTarget(contourHeadingDeg, fishingSpeed);
-                    return;
-                }
-            }
-        }
-        // Incorporates macro trend nudge modifying base heading if systematic tracking bias exists
-        if (haveCurrentPos && contourTrendRefSet) {
-            float dN2 = (currentLat_int - contourTrendRefLat_int) * METERS_PER_INT7_LAT;
-            float dE2 = (currentLon_int - contourTrendRefLon_int) * METERS_PER_INT7_LAT * contourTrendRefCosLat;
-
-            if (dN2 * dN2 + dE2 * dE2 >= CONTOUR_TREND_DIST_M * CONTOUR_TREND_DIST_M) {
-                float ddepth = depth_m - contourTrendRefDepth;
-                if (fabsf(ddepth) > TREND_DEPTH_MIN_M) {
-                    float nudge = contourKpSigned * (-ddepth * TREND_NUDGE_GAIN);
-                    if (nudge > TREND_NUDGE_MAX_DEG) nudge = TREND_NUDGE_MAX_DEG;
-                    if (nudge < -TREND_NUDGE_MAX_DEG) nudge = -TREND_NUDGE_MAX_DEG;
-
-                    contourBaseHeadingDeg += nudge;
-                    while (contourBaseHeadingDeg < 0.0f) contourBaseHeadingDeg += 360.0f;
-                    while (contourBaseHeadingDeg >= 360.0f) contourBaseHeadingDeg -= 360.0f;
-                }
-                contourTrendRefLat_int = currentLat_int;
-                contourTrendRefLon_int = currentLon_int;
-                contourTrendRefDepth = depth_m;
-                contourTrendRefCosLat = cosf(currentLat_deg * (float)M_PI / 180.0f);
-            }
-        } else if (haveCurrentPos && !contourTrendRefSet) {
-            contourTrendRefLat_int = currentLat_int;
-            contourTrendRefLon_int = currentLon_int;
-            contourTrendRefDepth = depth_m;
-            contourTrendRefCosLat = cosf(currentLat_deg * (float)M_PI / 180.0f);
-            contourTrendRefSet = true;
+            eLatPrev_m = eLat;
         }
 #if DEBUG_BREADCRUMB
         EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_FOLLOW_SEND_DONE);
@@ -1780,7 +1889,6 @@ void loop() {
             dptGlitchCount = 0;
 #endif
             circleLastDepth = contourTargetDepth_m;
-            contourTrendRefSet = false;
         }
 
         bool rmbFresh = rmbActive && ((now - lastRMBms) < RMB_TIMEOUT_MS);
