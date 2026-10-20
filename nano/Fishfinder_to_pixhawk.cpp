@@ -165,7 +165,7 @@ static mavlink_message_t mavMsg;
 
 // ---- Debug Flags ----
 // Feature flags to enable or disable MAVLink status text debugging
-#define DEBUG_RMB_PARSE 1
+#define DEBUG_RMB_PARSE 0
 #define DEBUG_GUIDED 1
 #define DEBUG_APPROACH 1
 #define DEBUG_SURVEY 1
@@ -218,7 +218,7 @@ static NavState navState = NavState::GUIDED; // Active operational logic state
 // rmb* Subsystem (NMEA Route Status)
 static bool rmbActive = false;               // Current RMB message valid flag
 static bool rmbEverActive = false;           // Indicates if RMB was received since boot
-static int32_t rmb_lat = 0;                  // Target latitude from RMB (1e7 deg)  
+static int32_t rmb_lat = 0;                  // Target latitude from RMB (1e7 deg)
 static int32_t rmb_lon = 0;                  // Target longitude from RMB (1e7 deg)
 static uint32_t lastRMBms = 0;               // Timestamp of last parsed RMB sentence
 static char prevDestWpId[13] = "";           // ID of previous destination WP
@@ -527,9 +527,8 @@ static void handleVTG(char* fields[], uint8_t n) {
     if (fields[1][0]) {
         vtg_cog_deg = parseFloat(fields[1]);
         haveVTGcog = true;
-    } else {
-        haveVTGcog = false;
     }
+	// empty COG field keeps last known value — cleared only by VTG_TIMEOUT_MS
 }
 
 // Parses NMEA DPT (Depth) outputted by the sonar
@@ -642,11 +641,11 @@ static void dbgCmd(const char* fmt, int val) {
 #endif
 
 // Queues and dispatches MAVLink buffer directly over hardware Serial to Pixhawk
-static bool mavSend() {
+static bool mavSend(uint16_t waitMs) {
     uint16_t len = mavlink_msg_to_send_buffer(mavBuf, &mavMsgTx);
     uint32_t waitStart = millis();
     while (Serial.availableForWrite() < len) {
-        if (millis() - waitStart > 20) return false;
+        if (millis() - waitStart > waitMs) return false;
     }
     Serial.write(mavBuf, len);
     return true;
@@ -656,13 +655,13 @@ static bool mavSend() {
 static void sendHeartbeat() {
     digitalWrite(HB_LED_PIN, !digitalRead(HB_LED_PIN));
     mavlink_msg_heartbeat_pack(SYS_ID, COMP_ID, &mavMsgTx, MAV_TYPE_ONBOARD_CONTROLLER, MAV_AUTOPILOT_INVALID, MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 0, MAV_STATE_ACTIVE);
-    mavSend();
+    mavSend(20);
 }
 
 // Commands the flight controller to change modes (e.g., to GUIDED, LOITER, or HOLD)
 static bool sendSetMode(uint8_t mode) {
     mavlink_msg_set_mode_pack(SYS_ID, COMP_ID, &mavMsgTx, TARGET_SYS, MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, (uint32_t)mode);
-    if (!mavSend()) return false;
+    if (!mavSend(20)) return false;
 #if DEBUG_LINK
     dbgCmd("CMD SET_MODE=%u", mode);
 #endif
@@ -711,7 +710,7 @@ static bool sendPositionTarget(int32_t lat, int32_t lon) {
     sp.lat_int = lat;
     sp.lon_int = lon;
     mavlink_msg_set_position_target_global_int_encode(SYS_ID, COMP_ID, &mavMsgTx, &sp);
-    return mavSend();
+    return mavSend(20);
 }
 
 // Instructs ArduRover to steer to a heading vector at a specific speed
@@ -728,13 +727,13 @@ static void sendVelocityTarget(float headingDeg, float speed_ms) {
     sp.vx = speed_ms * cosf(hRad);
     sp.vy = speed_ms * sinf(hRad);
     mavlink_msg_set_position_target_global_int_encode(SYS_ID, COMP_ID, &mavMsgTx, &sp);
-    mavSend();
+    mavSend(20);
 }
 
 // Transmits a DO_CHANGE_SPEED MAVLink command
 static bool sendSpeedCommand(float speed_ms) {
     mavlink_msg_command_long_pack(SYS_ID, COMP_ID, &mavMsgTx, TARGET_SYS, TARGET_COMP, MAV_CMD_DO_CHANGE_SPEED, 0, 1, speed_ms, -1, 0, 0, 0, 0);
-    if (!mavSend()) return false;
+    if (!mavSend(20)) return false;
 #if DEBUG_LINK
     dbgCmd("CMD SPEED=%d cm/s", (int)(speed_ms * 100.0f));
 #endif
@@ -744,7 +743,7 @@ static bool sendSpeedCommand(float speed_ms) {
 // Commands an immediate motor disarm sequence
 static bool sendDisarm() {
     mavlink_msg_command_long_pack(SYS_ID, COMP_ID, &mavMsgTx, TARGET_SYS, TARGET_COMP, MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0);
-    if (!mavSend()) return false;
+    if (!mavSend(20)) return false;
 #if DEBUG_LINK
     sendStatusText_P(MAV_SEVERITY_DEBUG, PSTR("CMD DISARM"));
 #endif
@@ -754,7 +753,7 @@ static bool sendDisarm() {
 // Dispatches a text string to Ground Control Stations (GCS)
 static void sendStatusText(uint8_t severity, const char* text) {
     mavlink_msg_statustext_pack(SYS_ID, COMP_ID, &mavMsgTx, severity, text, 0, 0);
-    mavSend();
+    mavSend(severity >= MAV_SEVERITY_DEBUG ? 0 : 20)
 }
 
 // Dispatches a PROGMEM text string to Ground Control Stations (GCS)
@@ -919,7 +918,9 @@ static void setCircleAnchor(float lat, int32_t lat_int, int32_t lon_int, float h
     activationPosValid = true;
 
     // Approximates the center of a tangent circle positioned CONTOUR_CIRCLE_RADIUS_M to the side
-    float approachHeadingDeg = havePixhawkHeading ? pixhawkHeadingDeg : vtg_cog_deg;
+    float approachHeadingDeg = havePixhawkHeading ? pixhawkHeadingDeg
+                            : haveVTGcog ? vtg_cog_deg
+                            : headingDeg;
     float hr = approachHeadingDeg * (float)M_PI / 180.0f;
     approachCenterLat_int = activationLat_int + (int32_t)((-sinf(hr)) * (CONTOUR_CIRCLE_RADIUS_M * 0.5f) * INT7_PER_METER_LAT);
     approachCenterLon_int = activationLon_int + (int32_t)((cosf(hr)) * (CONTOUR_CIRCLE_RADIUS_M * 0.5f) * INT7_PER_METER_LAT / activationCosLat);
@@ -1192,7 +1193,8 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
             }
         }
     } else if (!waypointReset && rmbEverActive) {
-        if (contourTrigger && haveDPT && haveVTGcog) {
+        if (contourTrigger && haveDPT && haveCurrentPos &&
+            haveLastLegHeading && (havePixhawkHeading || haveVTGcog)) {
             enterContourFollow();
         } else if (pixhawkMode == ROVER_MODE_HOLD) {
             // Guard: Intentionally do nothing to prevent LOITER reset while in HOLD mode
@@ -1201,7 +1203,16 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
             lastLoiterResetDestId[sizeof(lastLoiterResetDestId) - 1] = '\0';
             gotoLoiterReset(BC_LOITER_WP_RESET_RMB);
 #if DEBUG_GUIDED || DEBUG_APPROACH || DEBUG_SURVEY
-            sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER wp reset"));
+            if (!contourTrigger)
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER wp reset (no trg)"));
+            else if (!haveDPT)
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER wp reset (no DPT)"));
+            else if (!haveCurrentPos)
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER wp reset (no pos)"));
+            else if (!haveLastLegHeading)
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER wp reset (no leg)"));
+            else
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER wp reset (no hdg)"));
 #endif
         }
     }
