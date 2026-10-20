@@ -340,6 +340,12 @@ static uint32_t speedChangedMs = 0;          // EEPROM commit delay timer
 static uint32_t lastSpeedSendMs = 0;         // Keepalive timestamp
 static bool speedNeedsResend = false;        // Resend request flag after mode switches
 
+// Arrival ('A') timing & snapshot — last-value 'A' window + position/depth at first 'A'
+static uint32_t firstArrivedMs = 0;          // millis() of first 'A' frame for current dest
+static uint16_t learnedArrivedHoldMs = 3000; // last measured 'A'-window (default 3 s)
+static int32_t arrivalLat_int = 0;           // snapshot lat 1e7; (0,0)=no snapshot sentinel
+static int32_t arrivalLon_int = 0;           // snapshot lon 1e7
+
 // ---- NMEA Parsing Helpers ----
 static char nmeaBuf[84];
 static uint8_t nmeaIdx = 0;
@@ -462,6 +468,12 @@ static void handleRMB(char* fields[], uint8_t n) {
     }
 
     if (destChanged) {
+        // Learn 'A' window BEFORE the per-dest reset below clears the edge state
+        if (rmbArrived && firstArrivedMs) {
+            uint32_t dur = millis() - firstArrivedMs;
+            if (dur > 60000UL) dur = 60000UL;
+            learnedArrivedHoldMs = (uint16_t)dur;   // last measured value, not max
+        }
         haveLastLegHeading = false;
         bool isResume = isOriginStart
             && lastLoiterResetDestId[0] != '\0'
@@ -476,10 +488,22 @@ static void handleRMB(char* fields[], uint8_t n) {
 
         rmbArrived = false;
         contourTrigger = false;
+        firstArrivedMs = 0;
+        arrivalLat_int = 0;   // sentinel: no valid snapshot for new dest
+        arrivalLon_int = 0;
     }
 
     // Check the Arrival flag field
     if (fields[13][0] == 'A') {
+        if (!rmbArrived) {
+            firstArrivedMs = millis();
+            if (haveCurrentPos) {
+                arrivalLat_int = currentLat_int;
+                arrivalLon_int = currentLon_int;
+                // Depth snapshot stored directly in contourTargetDepth_m (survives until activation)
+                contourTargetDepth_m = haveDptEma ? depthEma_m : depth_m;
+            }
+        }
         rmbArrived = true;
 		lastLoiterResetDestId[0] = '\0';
         if (routeIsMultiWP && !followTriggeredForDest && rmbSeenNotArrivedForDest) {
@@ -487,6 +511,13 @@ static void handleRMB(char* fields[], uint8_t n) {
             followTriggeredForDest = true;
         }
     } else {
+        // Transient 'A'->'V' mid-dest (no destChanged): learn window here too
+        if (rmbArrived && firstArrivedMs) {
+            uint32_t dur = millis() - firstArrivedMs;
+            if (dur > 60000UL) dur = 60000UL;
+            learnedArrivedHoldMs = (uint16_t)dur;   // last measured value, not max
+            firstArrivedMs = 0;
+        }
         rmbArrived = false;
         rmbSeenNotArrivedForDest = true;
     }
@@ -953,17 +984,20 @@ static void enterContourFollow() {
     float entryHeadingDeg = lastLegHeadingDeg;
     contourHeadingDeg = entryHeadingDeg;
     contourBaseHeadingDeg = entryHeadingDeg;
-    contourTargetDepth_m = haveDptEma ? depthEma_m : depth_m;
+    bool haveArrivalSnapshot = (arrivalLat_int != 0) || (arrivalLon_int != 0);
+    if (!haveArrivalSnapshot) {
+        contourTargetDepth_m = haveDptEma ? depthEma_m : depth_m;
+    }
 
     haveDptEma = false;
     depthEma_m = 0.0f;
 
-    setCircleAnchor(haveCurrentPos ? currentLat_deg : 0.0f,
-                    haveCurrentPos ? currentLat_int : 0,
-                    haveCurrentPos ? currentLon_int : 0,
+    setCircleAnchor(haveArrivalSnapshot ? (arrivalLat_int * 1e-7f) : (haveCurrentPos ? currentLat_deg : 0.0f),
+                    haveArrivalSnapshot ? arrivalLat_int : (haveCurrentPos ? currentLat_int : 0),
+                    haveArrivalSnapshot ? arrivalLon_int : (haveCurrentPos ? currentLon_int : 0),
                     entryHeadingDeg);
 
-    activationPosValid = haveCurrentPos;
+    activationPosValid = haveArrivalSnapshot || haveCurrentPos;
     contourLastGoodValid = false;
     contourPhase = ContourPhase::CIRCLE_APPROACH;
     contourTrigger = false;
@@ -1145,7 +1179,12 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
             waypointReset = false;
             if (pendingMode == (int16_t)ROVER_MODE_GUIDED) pendingMode = -1;
 
-            if (contourTrigger && (!haveDPT || !haveVTGcog)) {
+            if (contourTrigger && rmbArrived && firstArrivedMs &&
+                (now - firstArrivedMs) > (uint32_t)learnedArrivedHoldMs + 100UL &&
+                haveDPT && haveCurrentPos && haveLastLegHeading &&
+                (havePixhawkHeading || haveVTGcog)) {
+                enterContourFollow();
+            } else if (contourTrigger && (!haveDPT || !haveVTGcog)) {
                 if (!posTargetSentForDest && sendPositionTarget(rmb_lat, rmb_lon)) {
                     posTargetSentForDest = true;
                 }
@@ -1630,7 +1669,11 @@ static void handleContourFollowState(uint32_t now, bool rmbFresh) {
 #endif
             navState = NavState::GUIDED;
             waypointReset = false;
+            routeIsMultiWP = false;
+            prevDestWpId[0] = '\0';
             posTargetSentForDest = false;
+            followTriggeredForDest = false;
+            rmbSeenNotArrivedForDest = false;
             contourTrigger = false;
             rmbArrived = false;
             speedNeedsResend = true;
