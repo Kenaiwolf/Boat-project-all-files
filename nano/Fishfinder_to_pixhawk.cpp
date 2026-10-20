@@ -505,7 +505,6 @@ static void handleRMB(char* fields[], uint8_t n) {
             }
         }
         rmbArrived = true;
-		lastLoiterResetDestId[0] = '\0';
         if (routeIsMultiWP && !followTriggeredForDest && rmbSeenNotArrivedForDest) {
             contourTrigger = true;
             followTriggeredForDest = true;
@@ -1226,7 +1225,10 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
             }
         }
     } else if (!waypointReset && rmbEverActive) {
-        if (pixhawkMode == ROVER_MODE_HOLD) {
+        if (contourTrigger && haveDPT && haveCurrentPos &&
+            haveLastLegHeading && (havePixhawkHeading || haveVTGcog)) {
+            enterContourFollow();
+        } else if (pixhawkMode == ROVER_MODE_HOLD) {
             // Guard: Intentionally do nothing to prevent LOITER reset while in HOLD mode
         } else {
             strncpy(lastLoiterResetDestId, prevDestWpId, sizeof(lastLoiterResetDestId) - 1);
@@ -1253,7 +1255,7 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
 #endif
         }
     }
-}}
+}
 
 // Drives a brief transition into LOITER mode to flush any active Pixhawk missions
 static void handleLoiterWpResetState(uint32_t now, bool rmbFresh) {
