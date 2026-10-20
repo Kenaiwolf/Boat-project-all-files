@@ -206,8 +206,6 @@ static void checkFreeRam(char tag) {
 enum class NavState : uint8_t { GUIDED, LOITER_WP_RESET, CONTOUR_FOLLOW };
 // Defines the sub-states used while executing contour following
 enum class ContourPhase : uint8_t { CIRCLE_APPROACH, CIRCLE_SURVEY, FOLLOW };
-// Identifies which speed profile is currently active
-enum class SpeedSlot : int8_t { NONE = -1, TRAVEL = 0, FISHING = 1 };
 
 static uint16_t resetCount = 0;              // Total processor restarts
 static uint8_t lastBreadcrumb = 0;           // Crash origin tracker
@@ -336,7 +334,6 @@ static bool haveCurrentPos = false;          // Position structure valid flag
 static uint8_t prevTrimState = 0;            // RC channel speed adjustment position
 static float travelSpeed = 0.0f;             // Active linear movement velocity (m/s)
 static float fishingSpeed = 0.0f;            // Active surveying movement velocity (m/s)
-static SpeedSlot activeSpeedSlot = SpeedSlot::NONE;
 static float lastSentSpeed = 0.0f;           // Cached command comparison variable
 static bool speedDirty = false;              // Active trim awaiting EEPROM commit
 static uint32_t speedChangedMs = 0;          // EEPROM commit delay timer
@@ -477,7 +474,6 @@ static void handleRMB(char* fields[], uint8_t n) {
         rmbSeenNotArrivedForDest = false;
         routeIsMultiWP = (!isOriginStart) || isResume;
 
-        activeSpeedSlot = routeIsMultiWP ? SpeedSlot::FISHING : SpeedSlot::TRAVEL;
         rmbArrived = false;
         contourTrigger = false;
     }
@@ -505,10 +501,9 @@ static void handleRMB(char* fields[], uint8_t n) {
             lastDC = destChanged; lastArr = rmbArrived; lastTrg = contourTrigger;
             char dbg[64];
             snprintf_P(dbg, sizeof(dbg),
-                PSTR("RMB dC=%d arr=%d mWP=%d trg=%d slot=%d id=%s"),
+                PSTR("RMB dC=%d arr=%d mWP=%d trg=%d id=%s"),
                 (int)destChanged, (int)rmbArrived, (int)routeIsMultiWP,
-                (int)contourTrigger,
-                (int)(int8_t)activeSpeedSlot, prevDestWpId);
+                (int)contourTrigger, prevDestWpId);
             sendStatusText(MAV_SEVERITY_DEBUG, dbg);
         }
     }
@@ -811,10 +806,10 @@ static void readMAVLink() {
 
                 if (trimState != prevTrimState) {
                     prevTrimState = trimState;
-                    if (trimState != 0 && activeSpeedSlot != SpeedSlot::NONE &&
+                    if (trimState != 0 &&
                         ((navState == NavState::GUIDED && rmbActive && (millis() - lastRMBms) < RMB_TIMEOUT_MS) || navState == NavState::CONTOUR_FOLLOW)) {
 
-                        float &spd = (activeSpeedSlot == SpeedSlot::TRAVEL) ? travelSpeed : fishingSpeed;
+                        float &spd = (navState == NavState::GUIDED && !routeIsMultiWP) ? travelSpeed : fishingSpeed;
                         if (trimState == 1) {
                             spd += SPEED_STEP_MS;
                             if (spd > MAX_SPEED_MS) spd = MAX_SPEED_MS;
@@ -831,7 +826,7 @@ static void readMAVLink() {
                             char dbg[40];
                             char spdStr[8];
                             dtostrf(spd, 4, 2, spdStr);
-                            snprintf(dbg, sizeof(dbg), "TRIM st=%u slot=%d spd=%s", (unsigned)trimState, (int)(int8_t)activeSpeedSlot, spdStr);
+                            snprintf(dbg, sizeof(dbg), "TRIM st=%u mWP=%d spd=%s", (unsigned)trimState, (int)routeIsMultiWP, spdStr);
                             sendStatusText(MAV_SEVERITY_DEBUG, dbg);
                         }
 #endif
@@ -850,9 +845,9 @@ static void readMAVLink() {
 #if DEBUG_SPEED_TRIM
                         {
                             char rj[48];
-                            snprintf(rj, sizeof(rj), "TRIM REJ st=%u ns=%d slot=%d rmbF=%d",
+                            snprintf(rj, sizeof(rj), "TRIM REJ st=%u ns=%d mWP=%d rmbF=%d",
                                      (unsigned)trimState, (int)navState,
-                                     (int)(int8_t)activeSpeedSlot,
+                                     (int)routeIsMultiWP,
                                      (int)(rmbActive && (millis() - lastRMBms) < RMB_TIMEOUT_MS));
                             sendStatusText(MAV_SEVERITY_DEBUG, rj);
                         }
@@ -973,7 +968,6 @@ static void enterContourFollow() {
     contourTrigger = false;
     navState = NavState::CONTOUR_FOLLOW;
     sendSpeedCommand(fishingSpeed);
-    activeSpeedSlot = SpeedSlot::FISHING;
 
 #if DEBUG_FREE_RAM
     checkFreeRam('Z');
@@ -1008,8 +1002,7 @@ static void reenterContourFromLastGood() {
     }
 
     contourPhase = ContourPhase::CIRCLE_SURVEY;
-    sendSpeedCommand(travelSpeed);
-    activeSpeedSlot = SpeedSlot::TRAVEL;
+    sendSpeedCommand(fishingSpeed);
 
 #if DEBUG_FOLLOW || DEBUG_APPROACH
     sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("CONTOUR: line lost -> re-circle"));
@@ -1157,7 +1150,7 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
                 }
             } else {
                 float commandedSpeed = vescNotActive ? 0.0f :
-                                       (activeSpeedSlot == SpeedSlot::TRAVEL) ? travelSpeed : (activeSpeedSlot == SpeedSlot::FISHING) ? fishingSpeed : DEFAULT_SPEED_MS;
+                                       (routeIsMultiWP ? fishingSpeed : travelSpeed);
 
                 if (speedNeedsResend) {
                     if (sendSpeedCommand(commandedSpeed)) {
@@ -1230,7 +1223,6 @@ static void handleLoiterWpResetState(uint32_t now, bool rmbFresh) {
     } else if (rmbFresh) {
         if (requestModeChange(ROVER_MODE_GUIDED, now)) {
             navState = NavState::GUIDED;
-            activeSpeedSlot = routeIsMultiWP ? SpeedSlot::FISHING : SpeedSlot::TRAVEL;
             speedNeedsResend = true;
         }
     } else if ((now - loiterStartMs) >= LOITER_RESET_MS) {
@@ -1273,8 +1265,7 @@ static void handleContourDepthLossRecovery(uint32_t now) {
             depthSlopeCount = 0;
             depthSlopeCumDist = 0.0f;
             surveyDptWasValid = false;
-            sendSpeedCommand(travelSpeed);
-            activeSpeedSlot = SpeedSlot::TRAVEL;
+            sendSpeedCommand(fishingSpeed);
         }
 #if DEBUG_BREADCRUMB
         EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_CONTOUR_DEPTH_RECOVERED);
@@ -1323,7 +1314,6 @@ static void handleContourApproachPhase(uint32_t now) {
             surveyDptWasValid = haveDPT;
             circleApproachSampled = false;
             contourPhase = ContourPhase::CIRCLE_SURVEY;
-            activeSpeedSlot = SpeedSlot::TRAVEL;
 #if DEBUG_BREADCRUMB
             EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_SURVEY_ENTER);
 #endif
@@ -1334,10 +1324,10 @@ static void handleContourApproachPhase(uint32_t now) {
             float bearingTangentDeg = theta + 90.0f;
             if (bearingTangentDeg < 0.0f) bearingTangentDeg += 360.0f;
             if (bearingTangentDeg >= 360.0f) bearingTangentDeg -= 360.0f;
-            sendVelocityTarget(bearingTangentDeg, activeSpeedSlot == SpeedSlot::FISHING ? fishingSpeed : travelSpeed);
+            sendVelocityTarget(bearingTangentDeg, fishingSpeed);
         }
     } else {
-        sendVelocityTarget(contourHeadingDeg, activeSpeedSlot == SpeedSlot::FISHING ? fishingSpeed : travelSpeed);
+        sendVelocityTarget(contourHeadingDeg, fishingSpeed);
     }
 }
 
@@ -1483,7 +1473,7 @@ static void handleContourSurveyPhase(uint32_t now) {
         float corrHead = tangHead + radCorr;
         while (corrHead < 0.0f) corrHead += 360.0f;
         while (corrHead >= 360.0f) corrHead -= 360.0f;
-        sendVelocityTarget(corrHead, activeSpeedSlot == SpeedSlot::FISHING ? fishingSpeed : travelSpeed);
+        sendVelocityTarget(corrHead, fishingSpeed);
 
         // When a full circle is completed, analyze data and enter follow phase
         if (circleAccumAngle >= 360.0f || circleAccumAngle <= -360.0f) {
@@ -1505,7 +1495,6 @@ static void handleContourSurveyPhase(uint32_t now) {
                 EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_FOLLOW_ENTER);
 #endif
                 sendSpeedCommand(fishingSpeed);
-                activeSpeedSlot = SpeedSlot::FISHING;
 #if DEBUG_SURVEY || DEBUG_FOLLOW
                 sendStatusText_P(MAV_SEVERITY_INFO, PSTR("CONTOUR: survey done -> follow"));
 #endif
@@ -1528,7 +1517,7 @@ static void handleContourSurveyPhase(uint32_t now) {
             }
         }
     } else {
-        sendVelocityTarget(contourHeadingDeg, activeSpeedSlot == SpeedSlot::FISHING ? fishingSpeed : travelSpeed);
+        sendVelocityTarget(contourHeadingDeg, fishingSpeed);
     }
 }
 
@@ -1589,7 +1578,7 @@ static void handleContourFollowPhase(uint32_t now) {
                     EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_FOLLOW_REENTER);
 #endif
                     reenterContourFromLastGood();
-                    sendVelocityTarget(contourHeadingDeg, travelSpeed);
+                    sendVelocityTarget(contourHeadingDeg, fishingSpeed);
                     return;
                 }
             }
@@ -1658,7 +1647,6 @@ static void handleContourFollowState(uint32_t now, bool rmbFresh) {
         routeIsMultiWP = false;
         prevDestWpId[0] = '\0';
         posTargetSentForDest = false;
-        activeSpeedSlot = SpeedSlot::NONE;
         contourTrigger = false;
         rmbArrived = false;
         speedNeedsResend = true;
