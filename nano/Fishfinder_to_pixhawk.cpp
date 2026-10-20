@@ -1226,30 +1226,34 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
             }
         }
     } else if (!waypointReset && rmbEverActive) {
-        if (contourTrigger && haveDPT && haveCurrentPos &&
-            haveLastLegHeading && (havePixhawkHeading || haveVTGcog)) {
-            enterContourFollow();
-        } else if (pixhawkMode == ROVER_MODE_HOLD) {
+        if (pixhawkMode == ROVER_MODE_HOLD) {
             // Guard: Intentionally do nothing to prevent LOITER reset while in HOLD mode
         } else {
             strncpy(lastLoiterResetDestId, prevDestWpId, sizeof(lastLoiterResetDestId) - 1);
             lastLoiterResetDestId[sizeof(lastLoiterResetDestId) - 1] = '\0';
             gotoLoiterReset(BC_LOITER_WP_RESET_RMB);
 #if DEBUG_GUIDED || DEBUG_APPROACH || DEBUG_SURVEY
+            // Diagnostika: preco sa follow pri utichnuti RMB nespustil
+            // (aktivacia vyzaduje contourTrigger && rmbArrived && firstArrivedMs
+            //  && elapsed > learnedArrivedHoldMs+100 && DPT && pos && leg && hdg)
             if (!contourTrigger)
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER wp reset (no trg)"));
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER (no trg)"));
+            else if (!rmbArrived || !firstArrivedMs)
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER (no A)"));
+            else if ((now - firstArrivedMs) <= (uint32_t)learnedArrivedHoldMs + 100UL)
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER (hold)"));
             else if (!haveDPT)
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER wp reset (no DPT)"));
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER (no DPT)"));
             else if (!haveCurrentPos)
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER wp reset (no pos)"));
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER (no pos)"));
             else if (!haveLastLegHeading)
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER wp reset (no leg)"));
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER (no leg)"));
             else
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER wp reset (no hdg)"));
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER (no hdg)"));
 #endif
         }
     }
-}
+}}
 
 // Drives a brief transition into LOITER mode to flush any active Pixhawk missions
 static void handleLoiterWpResetState(uint32_t now, bool rmbFresh) {
