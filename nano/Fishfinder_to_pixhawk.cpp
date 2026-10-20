@@ -753,7 +753,7 @@ static bool sendDisarm() {
 // Dispatches a text string to Ground Control Stations (GCS)
 static void sendStatusText(uint8_t severity, const char* text) {
     mavlink_msg_statustext_pack(SYS_ID, COMP_ID, &mavMsgTx, severity, text, 0, 0);
-    mavSend(severity >= MAV_SEVERITY_DEBUG ? 0 : 20)
+    mavSend(severity >= MAV_SEVERITY_DEBUG ? 0 : 20);
 }
 
 // Dispatches a PROGMEM text string to Ground Control Stations (GCS)
@@ -1648,7 +1648,11 @@ static void handleContourFollowState(uint32_t now, bool rmbFresh) {
     } else if (pixhawkMode == ROVER_MODE_HOLD) {
         // Guard: Maintain HOLD mode without falling through to GUIDED or depthLost actions
     } else if (pixhawkMode != ROVER_MODE_GUIDED) {
-        sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("CONTOUR: mode changed ext -> GUIDED"));
+        static bool extModeWarned = false;
+        if (!extModeWarned) {
+            extModeWarned = true;
+            sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("CONTOUR: mode changed ext -> GUIDED"));
+        }
         navState = NavState::GUIDED;
         waypointReset = true;
         routeIsMultiWP = false;
