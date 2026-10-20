@@ -481,6 +481,7 @@ static void handleRMB(char* fields[], uint8_t n) {
     // Check the Arrival flag field
     if (fields[13][0] == 'A') {
         rmbArrived = true;
+		lastLoiterResetDestId[0] = '\0';
         if (routeIsMultiWP && !followTriggeredForDest && rmbSeenNotArrivedForDest) {
             contourTrigger = true;
             followTriggeredForDest = true;
