@@ -294,12 +294,10 @@ static bool followSlopeValid = false;
 static float circleBestSlope = 0.0f;
 static float circleMinDepth = 0.0f;
 static float circleMaxDepth = 0.0f;
-static float crossDistAcc = 0.0f;
-static float crossSinceLast_m = 0.0f;
+static float crossSinceLast_m = 0.0f;      // metres since last accepted crossing (debounce + lost)
 static float excitAccum_m = 0.0f;
 static bool wasBelowTarget = false;
 static float ditherPhaseRad = 0.0f;
-static float eLatPrev_m = 0.0f;                 // reserved for D-term
 static int32_t prevPosLat_int = 0;
 static int32_t prevPosLon_int = 0;
 static int32_t slopePrevLat_int = 0;
@@ -314,7 +312,6 @@ static bool contourLastGoodValid = false;
 static int32_t contourLastGoodLat_int = 0;
 static int32_t contourLastGoodLon_int = 0;
 static float contourLastGoodHeadingDeg = 0.0f;
-static uint32_t contourLastGoodMs = 0;
 
 // vesc* & controller Subsystem
 static uint8_t pixhawkMode = 255;            // Cached MAVLink auto-pilot mode
@@ -983,15 +980,12 @@ static void setCircleAnchor(float lat, int32_t lat_int, int32_t lon_int, float h
     depthSlopeCount = 0;
     depthSlopeCumDist = 0.0f;
     lastContourOffsetDeg = 0.0f;
-    contourLastGoodMs = millis();
     followSlopeValid = false;
     circleBestSlope = 0.0f;
     circleMinDepth = circleMaxDepth = depth_m;
-    crossDistAcc = 0.0f;
     crossSinceLast_m = 0.0f;
     excitAccum_m = 0.0f;
     ditherPhaseRad = 0.0f;
-    eLatPrev_m = 0.0f;
 
 #if DEBUG_FREE_RAM
     checkFreeRam('G');
@@ -1331,7 +1325,6 @@ static void handleContourDepthLossRecovery(uint32_t now) {
     } else if (!dptStaleNow && depthLost) {
         depthLost = false;
         followSlopeValid = false;
-        crossDistAcc = 0.0f;
         crossSinceLast_m = 0.0f;
         excitAccum_m = 0.0f;
         if (haveCurrentPos) {
@@ -1530,7 +1523,7 @@ static void handleContourSurveyPhase(uint32_t now) {
                             circleBestLon_int = crossLon_int;
                             circleCrossFound = true;
                             circleBestSlope = fabsf(crossSlope);
-                            acceptedB = true;
+                            acceptedA = true;
                         }
                     } else {
                         if (devB < circleBestDev) {
@@ -1541,7 +1534,7 @@ static void handleContourSurveyPhase(uint32_t now) {
                             circleBestLon_int = crossLon_int;
                             circleCrossFound = true;
                             circleBestSlope = fabsf(crossSlope);
-                            acceptedA = true;
+                            acceptedB = true;
                         }
                     }
 #if DEBUG_CONTOUR_TUNING
@@ -1598,17 +1591,14 @@ static void handleContourSurveyPhase(uint32_t now) {
                 slopePrevLon_int = prevPosLon_int = tLon;
                 slopePrevDepth = depth_m;
                 slopePrevOffsetDeg = 0.0f;
-                crossDistAcc = 0.0f;
                 crossSinceLast_m = 0.0f;
                 excitAccum_m = 0.0f;
                 ditherPhaseRad = 0.0f;
-                eLatPrev_m = 0.0f;
                 wasBelowTarget = (depth_m > contourTargetDepth_m);
 
                 contourLastGoodLat_int = tLat;
                 contourLastGoodLon_int = tLon;
                 contourLastGoodHeadingDeg = circleBestHeading;
-                contourLastGoodMs = millis();
                 contourLastGoodValid = true;
 
                 contourPhase = ContourPhase::FOLLOW;
@@ -1703,19 +1693,17 @@ static void handleContourFollowPhase(uint32_t now) {
             bool slopeTooFlat = (latAmpRaw > DITHER_MAX_LAT_M);
             float latAmp = slopeTooFlat ? DITHER_MAX_LAT_M : latAmpRaw;
             if (slopeTooFlat) followSlopeValid = false;
-            float offAmp = latAmp * 57.29577951f;
+            float offAmp = atanf(latAmp * 6.2831853f / DITHER_PERIOD_M) * 57.29577951f;
             if (offAmp > DITHER_MAX_OFF_DEG) offAmp = DITHER_MAX_OFF_DEG;
             ditherPhaseRad += tickDist * 6.2831853f / DITHER_PERIOD_M;
             if (ditherPhaseRad >= 6.2831853f) ditherPhaseRad -= 6.2831853f;
 
             // --- crossing detection: unconditional accumulation, debounced accept ---
-            crossDistAcc += tickDist;
             crossSinceLast_m += tickDist;
             bool nowBelow = (error < 0.0f);
             if (nowBelow != wasBelowTarget && crossSinceLast_m >= CROSS_DEBOUNCE_M) {
                 wasBelowTarget = nowBelow;
                 crossSinceLast_m = 0.0f;
-                crossDistAcc = 0.0f;
                 if (haveVTGcog) {
                     float dh = vtg_cog_deg - contourBaseHeadingDeg;
                     while (dh > 180.0f) dh -= 360.0f;
@@ -1728,14 +1716,13 @@ static void handleContourFollowPhase(uint32_t now) {
                 contourLastGoodLon_int = tLon;
                 contourLastGoodHeadingDeg = contourHeadingDeg;
                 contourLastGoodValid = true;
-                contourLastGoodMs = now;
 #if DEBUG_FOLLOW
                 sendStatusText_P(MAV_SEVERITY_DEBUG, PSTR("CROSS"));
 #endif
             }
 
             // --- lost detection: no accepted crossing within distance budget ---
-            if (crossDistAcc >= CROSS_LOST_DIST_M) {
+            if (crossSinceLast_m >= CROSS_LOST_DIST_M) {
 #if DEBUG_BREADCRUMB
                 EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_FOLLOW_REENTER);
 #endif
@@ -1764,7 +1751,6 @@ static void handleContourFollowPhase(uint32_t now) {
 #if DEBUG_BREADCRUMB
             EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_FOLLOW_HEADING_DONE);
 #endif
-            eLatPrev_m = eLat;
         }
 #if DEBUG_BREADCRUMB
         EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_FOLLOW_SEND_DONE);
