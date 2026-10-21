@@ -82,9 +82,9 @@ static mavlink_message_t mavMsg;
 #define SEND_INTERVAL_MS 1000UL
 // Timeouts for declaring NMEA data stale
 #define RMB_TIMEOUT_MS 3000UL // can be lowered for helix dont change for 598ci HD
-#define VTG_TIMEOUT_MS 3000UL
 #define COG_MIN_SPEED_MS 0.15f  // pod touto EKF rychlostou (m/s) je COG nedefinovany -> invalid
 #define DPT_TIMEOUT_MS 3000UL
+#define GPS_POS_TIMEOUT_MS 2000UL // bez GPI od Pixhawku >2 s -> pozicia stale, invalidovat
 
 // Glitch filter for Depth (DPT) data to reject sudden anomalous sonar readings
 #define ENABLE_DPT_GLITCH_FILTER 1
@@ -238,12 +238,10 @@ static float lastLegHeadingDeg = 0.0f;       // Desired course towards WP
 static bool haveLastLegHeading = false;      // RMB valid course parsed
 static bool followTriggeredForDest = false;  // Contour activation lock
 
-// vtg* Subsystem (NMEA Course/Speed) — len krizova kontrola, riadenie ide z Pixhawk EKF
-static bool haveVTG = false;                 // Current VTG message valid flag
-static float vtg_cog_deg = 0.0f;             // Course over ground (deg)
-static uint32_t lastVTGms = 0;               // Timestamp of last valid VTG
-static float pixhawkCogDeg = 0.0f;           // COG z EKF (atan2(gp.vy,gp.vx)) — jediny COG pre riadenie
+// COG z Pixhawk EKF (jediny zdroj pre riadenie); NMEA VTG sa neparsuje
+static float pixhawkCogDeg = 0.0f;           // COG z EKF (atan2(gp.vy,gp.vx))
 static bool havePixhawkCog = false;          // platny len ked EKF ground speed > COG_MIN_SPEED_MS
+static uint32_t lastGPPosMs = 0;             // Timestamp of last GLOBAL_POSITION_INT
 
 // depth*/dpt* Subsystem (Sonar Depth)
 static bool haveDPT = false;                 // Current DPT message valid flag
@@ -558,21 +556,6 @@ static void handleRMB(char* fields[], uint8_t n) {
 #endif
 }
 
-// Parses NMEA VTG (Course Over Ground and Ground Speed)
-static void handleVTG(char* fields[], uint8_t n) {
-    if (n < 6 || !fields[5][0]) return;
-    if (n >= 10 && fields[9][0] == 'N') return; // Reject if indicator is 'N' (Data not valid)
-    if (!isdigit((uint8_t)fields[5][0]) && fields[5][0] != '.') return;
-
-    haveVTG = true;
-    lastVTGms = millis();
-
-    if (fields[1][0]) {
-        vtg_cog_deg = parseFloat(fields[1]);
-    }
-	// empty COG field keeps last known value — cleared only by VTG_TIMEOUT_MS
-}
-
 // Parses NMEA DPT (Depth) outputted by the sonar
 static void handleDPT(char* fields[], uint8_t n) {
     if (n < 2 || !fields[1][0]) return;
@@ -652,7 +635,6 @@ static void readNMEA() {
                 if (n > 0) {
                     const char* type = fields[0] + 2;
                     if (strncmp(type, "RMB", 3) == 0) handleRMB(fields, n);
-                    else if (strncmp(type, "VTG", 3) == 0) handleVTG(fields, n);
                     else if (strncmp(type, "DPT", 3) == 0) handleDPT(fields, n);
                 }
             }
@@ -910,6 +892,7 @@ static void readMAVLink() {
                 currentLon_int = gp.lon;
                 currentLat_deg = gp.lat * 1e-7f;
                 haveCurrentPos = true;
+                lastGPPosMs = millis();
 
                 if (gp.hdg <= 36000) {
                     pixhawkHeadingDeg = gp.hdg * 0.01f;
@@ -1221,7 +1204,7 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
                 haveDPT && haveCurrentPos && haveLastLegHeading &&
                 (havePixhawkHeading || havePixhawkCog)) {
                 enterContourFollow();
-            } else if (contourTrigger && (!haveDPT || !haveVTGcog)) {
+            } else if (contourTrigger && (!haveDPT || !(havePixhawkHeading || havePixhawkCog))) {
                 if (!posTargetSentForDest && sendPositionTarget(rmb_lat, rmb_lon)) {
                     posTargetSentForDest = true;
                 }
@@ -1655,7 +1638,7 @@ static void handleContourSurveyPhase(uint32_t now) {
     }
 }
 
-// Third phase of contour logic: proportional (P-only) tracking of depth error continuously updating trajectory heading
+// Third phase: lateral regulation e_lat = error/g, adaptive S-dither, crossing detection
 static void handleContourFollowPhase(uint32_t now) {
     if (haveDPT && depth_m < CONTOUR_SAFETY_DEPTH_M) {
         gotoLoiterReset(BC_LOITER_WP_RESET_FOLLOW);
@@ -1911,8 +1894,10 @@ void loop() {
     // 1Hz execution clock used for slower logic evaluations and state machine advancements
     if (now - lastSend >= SEND_INTERVAL_MS) {
         lastSend = now;
-        if (haveVTG && (now - lastVTGms) >= VTG_TIMEOUT_MS) {
-            haveVTG = false;
+        if (haveCurrentPos && (now - lastGPPosMs) >= GPS_POS_TIMEOUT_MS) {
+            haveCurrentPos = false;
+            havePixhawkHeading = false;
+            havePixhawkCog = false;
         }
         if (haveDPT && (now - lastDPTms) >= DPT_TIMEOUT_MS) {
             haveDPT = false;
