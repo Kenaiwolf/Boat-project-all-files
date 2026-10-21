@@ -319,6 +319,7 @@ static uint8_t pixhawkMode = 255;            // Cached MAVLink auto-pilot mode
 static bool pixhawkModeKnown = false;        // Indicates if mode has been initially read
 static uint8_t lastHbSysid = 0;              // System ID of transmitting host
 static uint16_t hbRxCount = 0;               // Total heartbeat packets received
+static uint32_t lastPixHbMs = 0;             // Timestamp of last Pixhawk heartbeat (RX link health)
 static int32_t vescState = -1;               // Arm/Disarm VESC node status
 static uint32_t lastVescStMs = 0;            // Timestamp of latest VESC health pack
 static bool vescStaleOrBad = true;           // Flag for active node dropout
@@ -802,6 +803,7 @@ static void readMAVLink() {
             if (mavMsg.msgid == MAVLINK_MSG_ID_HEARTBEAT) {
                 lastHbSysid = mavMsg.sysid;
                 hbRxCount++;
+                if (mavMsg.sysid == TARGET_SYS) lastPixHbMs = millis();
             }
             // Decodes host Heartbeat to track active auto-pilot mode updates
             if (mavMsg.msgid == MAVLINK_MSG_ID_HEARTBEAT && mavMsg.sysid == TARGET_SYS) {
@@ -1743,7 +1745,7 @@ static void handleContourFollowPhase(uint32_t now) {
                 }
                 contourLastGoodLat_int = tLat;
                 contourLastGoodLon_int = tLon;
-                contourLastGoodHeadingDeg = contourHeadingDeg;
+                contourLastGoodHeadingDeg = contourBaseHeadingDeg;
                 contourLastGoodValid = true;
 #if DEBUG_FOLLOW
                 sendStatusText_P(MAV_SEVERITY_DEBUG, PSTR("CROSS"));
@@ -1898,6 +1900,15 @@ void loop() {
             haveCurrentPos = false;
             havePixhawkHeading = false;
             havePixhawkCog = false;
+        }
+        if (lastPixHbMs != 0 && (now - lastPixHbMs) >= 3000UL) {
+            haveCurrentPos = false;
+            havePixhawkHeading = false;
+            havePixhawkCog = false;
+            pixhawkModeKnown = false;
+            holdLatched = true;
+            requestModeChange(ROVER_MODE_HOLD, now);
+            if (!vescDisarmSent && sendDisarm()) vescDisarmSent = true;
         }
         if (haveDPT && (now - lastDPTms) >= DPT_TIMEOUT_MS) {
             haveDPT = false;
