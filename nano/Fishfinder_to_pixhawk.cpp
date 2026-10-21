@@ -94,26 +94,26 @@ static mavlink_message_t mavMsg;
 
 // Contour following tuning parameters
 #define CONTOUR_CIRCLE_RADIUS_M 3.0f
-#define CONTOUR_MIN_TURN_RADIUS_M 1.0f
+#define CONTOUR_MIN_TURN_RADIUS_M 1.2f
 #define CONTOUR_SAFETY_DEPTH_M 0.8f
 #define CONTOUR_MAX_OFFSET_DEG 90.0f
-#define FOLLOW_K_LAT 0.5f
-#define FOLLOW_SLOPE_MIN 0.02f
-#define DEPTH_FLAT_M 0.05f
-#define SLOPE_MIN_PERP_M 0.25f
-#define SLOPE_UPD_MIN_DIST_M 1.0f
-#define SLOPE_DEPTH_MIN_M 0.05f
-#define SLOPE_EMA 0.3f
-#define SLOPE_DECAY 0.7f
-#define DITHER_DEPTH_M 0.5f
-#define DITHER_PERIOD_M 12.0f
-#define DITHER_MAX_LAT_M 15.0f
-#define DITHER_MAX_OFF_DEG 25.0f
-#define CROSS_DEBOUNCE_M 2.0f
-#define CROSS_LOST_DIST_M 20.0f
-#define TICK_DIST_MAX_M 5.0f
-#define FOLLOW_UNCERTAIN_CORR_DEG 20.0f
-#define LEVER_ARM_M 1.865f
+#define FOLLOW_K_LAT 0.5f              // atan zisk korekcie: deg ≈ atan(K_LAT * e_lat[m])
+#define FOLLOW_SLOPE_MIN 0.02f         // minimalny platny odhad sklonu dna (m/m); pod nim odhad nespoľahlivy
+#define DEPTH_FLAT_M 0.05f             // mrtve pasmo hlbkovej chyby: |error|<toto => eLat=0 (flat bottom)
+#define SLOPE_MIN_PERP_M 0.25f         // min. kolma zlozka drahy medzi ref. bodmi pre validny g update
+#define SLOPE_UPD_MIN_DIST_M 1.0f      // min. prejdena vzdialenost medzi ref. bodmi g-update (m)
+#define SLOPE_DEPTH_MIN_M 0.03f        // min. |dDepth| medzi ref. bodmi, aby update nebol sum
+#define SLOPE_EMA 0.3f                 // EMA vaha noveho merania g (0..1)
+#define SLOPE_DECAY 0.7f               // multiplikativny pokles g za kazdych DITHER_PERIOD_M bez excitacie
+#define DITHER_DEPTH_M 0.25f           // cielova hlbkova vychylka S-ditheru NA JEDNU STRANU (m)
+#define DITHER_PERIOD_M 12.0f          // min. perioda S-vlny v metroch drahy; efektivna perioda rastie s amplitudou
+#define DITHER_MAX_LAT_M 2.0f          // max. kolma amplituda S-vlny (m); nad nou = dno prilis plocha, g invalid
+#define DITHER_MAX_OFF_DEG 45.0f       // tvrdy strop uhla vychylky od tangensu (defenzivny)
+#define CROSS_DEBOUNCE_M 2.0f          // min. draha medzi akceptovanymi crossingmi (m)
+#define CROSS_LOST_DIST_M 20.0f        // draha bez crossing => lost -> reenter + re-survey (m)
+#define TICK_DIST_MAX_M 5.0f           // clamp per-tick vzdialenosti (GPS skok, navrat z outage)
+#define FOLLOW_UNCERTAIN_CORR_DEG 20.0f// cap korekcie ked g neplatny alebo dno ploché
+#define LEVER_ARM_M 1.865f             // vzdialenost transduceru ZA polohou Pixhawk (m, pozdĺž osi lode)
 
 // Operational delays and global scaling factors
 #define LOITER_RESET_MS 1500UL
@@ -297,6 +297,7 @@ static float circleMaxDepth = 0.0f;
 static float crossSinceLast_m = 0.0f;      // metres since last accepted crossing (debounce + lost)
 static float excitAccum_m = 0.0f;
 static bool wasBelowTarget = false;
+static bool followReturnLeg = false;   // true = navrat na circleBest bod pred tangent follow
 static float ditherPhaseRad = 0.0f;
 static int32_t prevPosLat_int = 0;
 static int32_t prevPosLon_int = 0;
@@ -1595,6 +1596,13 @@ static void handleContourSurveyPhase(uint32_t now) {
                 excitAccum_m = 0.0f;
                 ditherPhaseRad = 0.0f;
                 wasBelowTarget = (depth_m > contourTargetDepth_m);
+                // Return leg: ak sa lod vzdialila od vybrateho crossing bodu (>1.5 m),
+                // najprv sa vrat nan — inak tangent kurz vytvori paralelnu drahu
+                {
+                    float dRb = (circleBestLat_int - tLat) * METERS_PER_INT7_LAT;
+                    float dEb = (circleBestLon_int - tLon) * METERS_PER_INT7_LAT * activationCosLat;
+                    followReturnLeg = (dRb * dRb + dEb * dEb > 2.25f);
+                }
 
                 contourLastGoodLat_int = tLat;
                 contourLastGoodLon_int = tLon;
@@ -1645,6 +1653,24 @@ static void handleContourFollowPhase(uint32_t now) {
             int32_t tLat, tLon;
             transducerPos(tLat, tLon);
 
+            if (followReturnLeg) {
+                float dNr = (circleBestLat_int - tLat) * METERS_PER_INT7_LAT;
+                float dEr = (circleBestLon_int - tLon) * METERS_PER_INT7_LAT * activationCosLat;
+                if (dNr * dNr + dEr * dEr <= 1.0f) {
+                    followReturnLeg = false;   // sme na crossing bode -> normalny follow
+                } else {
+                    contourHeadingDeg = atan2f(dEr, dNr) * 57.29577951f;
+                    if (contourHeadingDeg < 0.0f) contourHeadingDeg += 360.0f;
+                    // referencie posunieme, aby navrat nekontaminoval g-update
+                    prevPosLat_int = slopePrevLat_int = tLat;
+                    prevPosLon_int = slopePrevLon_int = tLon;
+                    slopePrevDepth = depth_m;
+                    slopePrevOffsetDeg = 0.0f;
+                    sendVelocityTarget(contourHeadingDeg, fishingSpeed);
+                    return;
+                }
+            }
+
             // --- per-tick distance (transducer frame) ---
             float dNt = (tLat - prevPosLat_int) * METERS_PER_INT7_LAT;
             float dEt = (tLon - prevPosLon_int) * METERS_PER_INT7_LAT * activationCosLat;
@@ -1662,7 +1688,8 @@ static void handleContourFollowPhase(uint32_t now) {
                 float dd = depth_m - slopePrevDepth;
                 if (fabsf(dd) >= SLOPE_DEPTH_MIN_M && dPerp >= SLOPE_MIN_PERP_M) {
                     float gMeas = fabsf(dd) / dPerp;
-                    followSlope = SLOPE_EMA * gMeas + (1.0f - SLOPE_EMA) * followSlope;
+                    if (!followSlopeValid) followSlope = gMeas;
+                    else followSlope = SLOPE_EMA * gMeas + (1.0f - SLOPE_EMA) * followSlope;
                     followSlopeValid = (followSlope >= FOLLOW_SLOPE_MIN);
                     excitAccum_m = 0.0f;
 #if DEBUG_FOLLOW
@@ -1693,9 +1720,13 @@ static void handleContourFollowPhase(uint32_t now) {
             bool slopeTooFlat = (latAmpRaw > DITHER_MAX_LAT_M);
             float latAmp = slopeTooFlat ? DITHER_MAX_LAT_M : latAmpRaw;
             if (slopeTooFlat) followSlopeValid = false;
-            float offAmp = atanf(latAmp * 6.2831853f / DITHER_PERIOD_M) * 57.29577951f;
+            // Adaptivna perioda: P_eff = max(DITHER_PERIOD_M, 2pi*latAmp)
+            // => tan(offAmp) <= 1 => offAmp nikdy >45°; frekvencia klesa s amplitudou
+            float periodEff = latAmp * 6.2831853f;
+            if (periodEff < DITHER_PERIOD_M) periodEff = DITHER_PERIOD_M;
+            float offAmp = atanf(latAmp * 6.2831853f / periodEff) * 57.29577951f;
             if (offAmp > DITHER_MAX_OFF_DEG) offAmp = DITHER_MAX_OFF_DEG;
-            ditherPhaseRad += tickDist * 6.2831853f / DITHER_PERIOD_M;
+            ditherPhaseRad += tickDist * 6.2831853f / periodEff;
             if (ditherPhaseRad >= 6.2831853f) ditherPhaseRad -= 6.2831853f;
 
             // --- crossing detection: unconditional accumulation, debounced accept ---
