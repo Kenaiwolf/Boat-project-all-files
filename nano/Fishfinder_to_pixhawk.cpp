@@ -1001,7 +1001,7 @@ static void enterContourFollow() {
     if (!haveArrivalSnapshot) {
         contourTargetDepth_m = haveDptEma ? depthEma_m : depth_m;
     }
-    if (contourTargetDepth_m < FOLLOW_MIN_DEPTH_M) contourTargetDepth_m = FOLLOW_MIN_DEPTH_M;
+    if (contourTargetDepth_m < CONTOUR_MIN_TARGET_DEPTH_M) contourTargetDepth_m = CONTOUR_MIN_TARGET_DEPTH_M;
 
     haveDptEma = false;
     depthEma_m = 0.0f;
