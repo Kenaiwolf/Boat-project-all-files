@@ -1203,7 +1203,7 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
                 haveDPT && haveCurrentPos && haveLastLegHeading &&
                 (havePixhawkHeading || havePixhawkCog)) {
                 enterContourFollow();
-            } else if (contourTrigger && (!haveDPT || !(havePixhawkHeading || havePixhawkCog))) {
+            } else if (contourTrigger && (!haveCurrentPos || !haveLastLegHeading)) {
                 if (!posTargetSentForDest && sendPositionTarget(rmb_lat, rmb_lon)) {
                     posTargetSentForDest = true;
                 }
