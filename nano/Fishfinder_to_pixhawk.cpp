@@ -582,12 +582,9 @@ static void handleDPT(char* fields[], uint8_t n) {
     }
 #if DEBUG_CONTOUR_TUNING
     {
-        char dbg[48];
-        char dRaw[8], dGl[8];
-        dtostrf(d, 6, 2, dRaw);
-        dtostrf(glitch, 6, 2, dGl);
-        snprintf_P(dbg, sizeof(dbg), PSTR("DPT raw=%s gl=%s cnt=%d acc=%d"),
-                 dRaw, dGl, (int)dptGlitchCount, (int)accept);
+        char dbg[40];
+        snprintf_P(dbg, sizeof(dbg), PSTR("DPT d=%dcm gl=%dcm cnt=%d acc=%d"),
+                 (int)(d * 100.0f), (int)(glitch * 100.0f), (int)dptGlitchCount, (int)accept);
         sendStatusText(MAV_SEVERITY_DEBUG, dbg);
     }
 #endif
@@ -1481,11 +1478,10 @@ static void handleContourSurveyPhase(uint32_t now) {
                 }
 #if DEBUG_CONTOUR_TUNING
                 {
-                    char dbg[48];
-                    char pe[8], ce[8];
-                    dtostrf(prevErr, 6, 2, pe);
-                    dtostrf(currErr, 6, 2, ce);
-                    snprintf(dbg, sizeof(dbg), "XING pe=%s ce=%s slV=%d cnt=%d", pe, ce, (int)deepSideValid, (int)depthSlopeCount);
+                    char dbg[44];
+                    snprintf_P(dbg, sizeof(dbg), PSTR("XING pe=%d ce=%d sl=%d v=%d n=%d"),
+                             (int)(prevErr * 100.0f), (int)(currErr * 100.0f),
+                             (int)(crossSlope * 1000.0f), (int)deepSideValid, (int)depthSlopeCount);
                     sendStatusText(MAV_SEVERITY_DEBUG, dbg);
                 }
 #endif
@@ -1540,10 +1536,10 @@ static void handleContourSurveyPhase(uint32_t now) {
                     }
 #if DEBUG_CONTOUR_TUNING
                     {
-                        char dbg[48];
-                        char bd[8];
-                        dtostrf(circleBestDev, 6, 2, bd);
-                        snprintf(dbg, sizeof(dbg), "XING acc=%d dev=%s side=%d", (int)(acceptedA || acceptedB), bd, (int)circleBestDeepRight);
+                        char dbg[44];
+                        snprintf_P(dbg, sizeof(dbg), PSTR("XACC=%d dev=%d side=%d g=%d"),
+                                 (int)(acceptedA || acceptedB), (int)circleBestDev,
+                                 (int)circleBestDeepRight, (int)(circleBestSlope * 1000.0f));
                         sendStatusText(MAV_SEVERITY_DEBUG, dbg);
                     }
 #endif
@@ -1608,6 +1604,14 @@ static void handleContourSurveyPhase(uint32_t now) {
                 contourLastGoodLon_int = tLon;
                 contourLastGoodHeadingDeg = circleBestHeading;
                 contourLastGoodValid = true;
+#if DEBUG_CONTOUR_TUNING
+                {
+                    char dbg[44];
+                    snprintf_P(dbg, sizeof(dbg), PSTR("FOLLOW g=%d ret=%d"),
+                             (int)(followSlope * 1000.0f), (int)followReturnLeg);
+                    sendStatusText(MAV_SEVERITY_INFO, dbg);
+                }
+#endif
 
                 contourPhase = ContourPhase::FOLLOW;
 #if DEBUG_BREADCRUMB
@@ -1692,8 +1696,13 @@ static void handleContourFollowPhase(uint32_t now) {
                     else followSlope = SLOPE_EMA * gMeas + (1.0f - SLOPE_EMA) * followSlope;
                     followSlopeValid = (followSlope >= FOLLOW_SLOPE_MIN);
                     excitAccum_m = 0.0f;
-#if DEBUG_FOLLOW
-                    sendStatusText_P(MAV_SEVERITY_DEBUG, PSTR("g_meas updated"));
+#if DEBUG_CONTOUR_TUNING
+                {
+                    char dbg[40];
+                    snprintf_P(dbg, sizeof(dbg), PSTR("G upd g=%d meas=%d"),
+                             (int)(followSlope * 1000.0f), (int)(gMeas * 1000.0f));
+                    sendStatusText(MAV_SEVERITY_DEBUG, dbg);
+                }
 #endif
                 } else {
                     excitAccum_m += dist;
@@ -1701,8 +1710,12 @@ static void handleContourFollowPhase(uint32_t now) {
                         followSlope *= SLOPE_DECAY;
                         followSlopeValid = (followSlope >= FOLLOW_SLOPE_MIN);
                         excitAccum_m = 0.0f;
-#if DEBUG_FOLLOW
-                        sendStatusText_P(MAV_SEVERITY_DEBUG, PSTR("SLOPE decay"));
+#if DEBUG_CONTOUR_TUNING
+                        {
+                            char dbg[36];
+                            snprintf_P(dbg, sizeof(dbg), PSTR("SLOPE decay g=%d"), (int)(followSlope * 1000.0f));
+                            sendStatusText(MAV_SEVERITY_DEBUG, dbg);
+                        }
 #endif
                     }
                 }
@@ -1747,8 +1760,13 @@ static void handleContourFollowPhase(uint32_t now) {
                 contourLastGoodLon_int = tLon;
                 contourLastGoodHeadingDeg = contourBaseHeadingDeg;
                 contourLastGoodValid = true;
-#if DEBUG_FOLLOW
-                sendStatusText_P(MAV_SEVERITY_DEBUG, PSTR("CROSS"));
+#if DEBUG_CONTOUR_TUNING
+                {
+                    char dbg[44];
+                    snprintf_P(dbg, sizeof(dbg), PSTR("CROSS h=%d a=%d x=%d"),
+                             (int)contourBaseHeadingDeg, (int)latAmp * 10, (int)(crossSinceLast_m * 10.0f));
+                    sendStatusText(MAV_SEVERITY_DEBUG, dbg);
+                }
 #endif
             }
 
@@ -1786,7 +1804,7 @@ static void handleContourFollowPhase(uint32_t now) {
 #if DEBUG_BREADCRUMB
         EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_FOLLOW_SEND_DONE);
 #endif
-        sendVelocityTarget(contourHeadingDeg, fishingSpeed);
+        sendVelocityTarget(contourHeadingDeg, haveCurrentPos ? fishingSpeed : 0.0f);
     }
 }
 
