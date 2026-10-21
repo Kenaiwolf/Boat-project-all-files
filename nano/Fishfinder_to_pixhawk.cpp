@@ -1258,7 +1258,7 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
 #if DEBUG_GUIDED || DEBUG_APPROACH || DEBUG_SURVEY
             // Diagnostika: preco sa follow pri utichnuti RMB nespustil
             // (aktivacia vyzaduje contourTrigger && rmbArrived && firstArrivedMs
-            //  && elapsed > learnedArrivedHoldMs+100 && DPT && pos && leg && hdg)
+            //  && DPT && pos && leg && hdg)
             if (!contourTrigger)
                 sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER (no trg)"));
             else if (!rmbArrived)
