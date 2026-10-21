@@ -97,6 +97,7 @@ static mavlink_message_t mavMsg;
 #define CONTOUR_CIRCLE_RADIUS_M 3.0f
 #define CONTOUR_MIN_TURN_RADIUS_M 1.2f
 #define CONTOUR_SAFETY_DEPTH_M 0.8f
+#define CONTOUR_MIN_TARGET_DEPTH_M 1.5f  // Minimálna cieľová izobata — aktivácia na plytčine sa clampne
 #define CONTOUR_MAX_OFFSET_DEG 90.0f
 #define FOLLOW_K_LAT 0.5f              // atan zisk korekcie: deg ≈ atan(K_LAT * e_lat[m])
 #define FOLLOW_SLOPE_MIN 0.02f         // minimalny platny odhad sklonu dna (m/m); pod nim odhad nespoľahlivy
@@ -1000,6 +1001,7 @@ static void enterContourFollow() {
     if (!haveArrivalSnapshot) {
         contourTargetDepth_m = haveDptEma ? depthEma_m : depth_m;
     }
+    if (contourTargetDepth_m < FOLLOW_MIN_DEPTH_M) contourTargetDepth_m = FOLLOW_MIN_DEPTH_M;
 
     haveDptEma = false;
     depthEma_m = 0.0f;
