@@ -1248,7 +1248,9 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
         }
     } else if (!waypointReset && rmbEverActive) {
         if (contourTrigger && haveDPT && haveCurrentPos &&
-            haveLastLegHeading && (havePixhawkHeading || havePixhawkCog)) {
+            haveLastLegHeading && (havePixhawkHeading || havePixhawkCog) &&
+            rmbArrived && firstArrivedMs &&
+            (now - firstArrivedMs) > (uint32_t)learnedArrivedHoldMs + 100UL) {
             enterContourFollow();
         } else if (pixhawkMode == ROVER_MODE_HOLD) {
             // Guard: Intentionally do nothing to prevent LOITER reset while in HOLD mode
@@ -1638,6 +1640,9 @@ static void handleContourSurveyPhase(uint32_t now) {
                 depthSlopeHead = 0;
                 depthSlopeCumDist = 0.0f;
                 circleLastDepth = haveDPT ? depth_m : contourTargetDepth_m;
+                circleMinDepth = circleLastDepth;
+                circleMaxDepth = circleLastDepth;
+                circleBestSlope = 0.0f;
                 surveyDptWasValid = haveDPT;
             }
         }
@@ -1749,6 +1754,14 @@ static void handleContourFollowPhase(uint32_t now) {
             bool nowBelow = (error < 0.0f);
             if (nowBelow != wasBelowTarget && crossSinceLast_m >= CROSS_DEBOUNCE_M) {
                 wasBelowTarget = nowBelow;
+#if DEBUG_CONTOUR_TUNING
+                {
+                    char dbg[44];
+                    snprintf_P(dbg, sizeof(dbg), PSTR("CROSS h=%d a=%d x=%d"),
+                             (int)contourBaseHeadingDeg, (int)(latAmp * 10.0f), (int)(crossSinceLast_m * 10.0f));
+                    sendStatusText(MAV_SEVERITY_DEBUG, dbg);
+                }
+#endif
                 crossSinceLast_m = 0.0f;
                 if (havePixhawkCog) {
                     float dh = pixhawkCogDeg - contourBaseHeadingDeg;
@@ -1762,14 +1775,6 @@ static void handleContourFollowPhase(uint32_t now) {
                 contourLastGoodLon_int = tLon;
                 contourLastGoodHeadingDeg = contourBaseHeadingDeg;
                 contourLastGoodValid = true;
-#if DEBUG_CONTOUR_TUNING
-                {
-                    char dbg[44];
-                    snprintf_P(dbg, sizeof(dbg), PSTR("CROSS h=%d a=%d x=%d"),
-                             (int)contourBaseHeadingDeg, (int)latAmp * 10, (int)(crossSinceLast_m * 10.0f));
-                    sendStatusText(MAV_SEVERITY_DEBUG, dbg);
-                }
-#endif
             }
 
             // --- lost detection: no accepted crossing within distance budget ---
