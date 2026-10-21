@@ -1034,11 +1034,11 @@ static void enterContourFollow() {
 #endif
 }
 
-// Returns estimated transducer position: 1.865 m aft of Pixhawk along heading (starboard 30 mm ignored)
-static void transducerPos(int32_t &lat_out, int32_t &lon_out) {
+// Returns estimated transducer position of any CG point: shifted 1.865 m aft along heading (starboard 30 mm ignored)
+static void transducerPos(int32_t lat_in, int32_t lon_in, int32_t &lat_out, int32_t &lon_out) {
     float hRad = (havePixhawkHeading ? pixhawkHeadingDeg : contourHeadingDeg) * (float)M_PI / 180.0f;
-    lat_out = currentLat_int - (int32_t)(LEVER_ARM_M * cosf(hRad) * INT7_PER_METER_LAT);
-    lon_out = currentLon_int - (int32_t)(LEVER_ARM_M * sinf(hRad) * INT7_PER_METER_LAT / activationCosLat);
+    lat_out = lat_in - (int32_t)(LEVER_ARM_M * cosf(hRad) * INT7_PER_METER_LAT);
+    lon_out = lon_in - (int32_t)(LEVER_ARM_M * sinf(hRad) * INT7_PER_METER_LAT / activationCosLat);
 }
 
 // Recalibrates geometry when contour tracking was temporarily lost and the system reverts to survey mode
@@ -1330,7 +1330,7 @@ static void handleContourDepthLossRecovery(uint32_t now) {
         excitAccum_m = 0.0f;
         if (haveCurrentPos) {
             int32_t tLat, tLon;
-            transducerPos(tLat, tLon);
+            transducerPos(currentLat_int, currentLon_int, tLat, tLon);
             prevPosLat_int = tLat; prevPosLon_int = tLon;
             slopePrevLat_int = tLat; slopePrevLon_int = tLon;
             slopePrevOffsetDeg = lastContourOffsetDeg;
@@ -1510,8 +1510,10 @@ static void handleContourSurveyPhase(uint32_t now) {
                     if (crossFrac < 0.0f) crossFrac = 0.0f;
                     if (crossFrac > 1.0f) crossFrac = 1.0f;
 
-                    int32_t crossLat_int = circlePrevLat_int + (int32_t)((currentLat_int - circlePrevLat_int) * crossFrac);
-                    int32_t crossLon_int = circlePrevLon_int + (int32_t)((currentLon_int - circlePrevLon_int) * crossFrac);
+                    int32_t crossLatCG = circlePrevLat_int + (int32_t)((currentLat_int - circlePrevLat_int) * crossFrac);
+                    int32_t crossLonCG = circlePrevLon_int + (int32_t)((currentLon_int - circlePrevLon_int) * crossFrac);
+                    int32_t crossLat_int, crossLon_int;
+                    transducerPos(crossLatCG, crossLonCG, crossLat_int, crossLon_int);
                     bool acceptedA = false, acceptedB = false;
 
                     // Choose alignment best matching original approach vector
@@ -1583,7 +1585,7 @@ static void handleContourSurveyPhase(uint32_t now) {
 
                 int32_t tLat, tLon;
                 if (haveCurrentPos) {
-                    transducerPos(tLat, tLon);
+                    transducerPos(currentLat_int, currentLon_int, tLat, tLon);
                 } else {
                     tLat = circleBestLat_int;
                     tLon = circleBestLon_int;
@@ -1651,7 +1653,7 @@ static void handleContourFollowPhase(uint32_t now) {
 #endif
         if (haveDPT && haveCurrentPos) {
             int32_t tLat, tLon;
-            transducerPos(tLat, tLon);
+            transducerPos(currentLat_int, currentLon_int, tLat, tLon);
 
             if (followReturnLeg) {
                 float dNr = (circleBestLat_int - tLat) * METERS_PER_INT7_LAT;
