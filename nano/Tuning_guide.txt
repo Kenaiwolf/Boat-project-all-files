@@ -31,4 +31,44 @@ Dither príliš široký/úzky	latAmp saturácia	DITHER_DEPTH_M
 Priveľa re-survey	REENTER správy	CROSS_LOST_DIST_M ↑
 Falošné crossingy	CROSS tesno po sebe	CROSS_DEBOUNCE_M ↑
 Follow diverguje pri vstupe	eL v g_meas rastie	prior ĝ zo survey zlý → circleBestSlope
-Prvá vec pri ladení: nechať bežať 2–3 survey cykly a len zbierať správy — neladiť po prvom behu, lebo jediný odhad ĝ bez kontextu nepovie, či je chyba v konštante alebo v teréne.
+Prvá vec pri ladení: nechať bežať 2–3 survey cykly a len zbierať správy — neladiť po prvom behu, lebo jediný odhad ĝ bez kontextu nepovie, či je chyba v konštante alebo v teréne.  
+  
+Nastavované konštanty — ako získať hodnotu pozorovaním lode  
+  
+Mechanika (merať metrom na lodi, nie ladiť):  
+- LEVER_ARM_M: vzdialenosť Pixhawk → transducer pozdĺž osi lode, v metroch. Teraz 1.865. Musí sedieť presne — zlá hodnota posúva všetky hĺbkové body.  
+- CONTOUR_CIRCLE_RADIUS_M: priemer survey kruhu. Pozorovanie: kruh musí byť dostatočne veľký, aby loď stihla otočiť bez utopenia rýchlosti — ak v survey loď zastavuje na otočkách, kruh je malý. Príliš veľký kruh = dlhý survey a ĝ z crossingov je prislabý (spread vzoriek je cez svah, nie cez izobatu).  
+  
+Bezpečnosť (zadefinovať z prevádzky, nie ladiť):  
+- CONTOUR_SAFETY_DEPTH_M: minimálna hĺbka, pod ktorou sa contour preruší. Nastav na plytčinu, kde ešte loď bezpečne pláva + rezerva na vlnu.  
+- DPT_TIMEOUT_MS / GPS_POS_TIMEOUT_MS / heartbeat 3 s: časové stráže. Neladia sa — ak reagujú príliš neskoro, zmenš; ak príliš často (krátke výpadky spúšťajú recovery), zväčši o 50 %.  
+  
+Survey hĺbkomer:  
+- DEPTH_SLOPE_MIN_DIST_M: minimálna vzdialenosť medzi bodmi na výpočet sklonu. Ak je kratšia, slope sa počíta zo šumu. Pozorovanie: xslope v SURV správach by mal byť konzistentný pri opakovaných kruhoch — ak skáče ±50 %, príliš krátke.  
+- DEPTH_SLOPE_CONF_THR: prah akceptovania sklonu. Ak survey odmietne crossing s rozumným xslope, prah je vysoký. Ak akceptuje crossing v šume, prah je nízky.  
+- SLOPE_DEPTH_MIN_M (0.03): minimálna merateľná Δhĺbka. Pod touto hodnotou sa vzorka pokladá za šum — nemeň pod 1 cm rozlíšenie sonaru ×3.  
+  
+Follow regulácia:  
+- FOLLOW_K_LAT: zosilnenie korekcie smeru. Pozorovanie: po vychýlení sa loď má vrátiť na izobatu plynulo bez presvihu. Presvih (oscilácia okolo izobaty) = znížiť. Lenivý návrat (loď sa vracia pomaly, stále je mimo) = zvýšiť.  
+- FOLLOW_SLOPE_MIN (0.02): minimálny ĝ, kde ešte laterálna regulácia dáva zmysel. Pod ním eLat diverguje — nemeň pod ~0,01.  
+- FOLLOW_UNCERTAIN_CORR_DEG (20): max korekcia smeru pri neznámom svahu. Ak loď pri vstupe do follow „skáče" smerom (prudká zmena heading), znížiť. Ak pri prechode na ploché dno loď nevracia k izobate dostatočne agresívne, zvýšiť.  
+  
+Dither (S-vlna):  
+- DITHER_DEPTH_M (0.25): polovičná amplitúda hĺbkového vlnenia v metroch — loď sa pohybuje medzi target−0,25 a target+0,25. Pozorovanie z brehu: vlna má byť viditeľná, ale nie panická — ak loď na izobate „behá" hore-dole viac než ±30 cm, znížiť; ak slope estimator hlási len decay (žiadna excitácia), zvýšiť.  
+- DITHER_MAX_LAT_M (2.0) / DITHER_MAX_OFF_DEG (45): obmedzujú šírku S-vlny — loď nepôjde šikmiejšie než 45° od tangentu, laterálne nie viac než ~2 m od izobaty. Ak dither ťahá loď príliš ďaleko od línie (napr. v tesnej zátok), znížiť MAX_LAT; ak loď na strmom svahu „reže" rohy zatáčok, znížiť MAX_OFF.  
+- DITHER_PERIOD_M (12): dráha jednej S-periódy. Určuje frekvenciu vlnenia. Ak potrebuješ viac vzoriek na meter (jemnejšie mapovanie svahu), znížiť — ale pod ~8 m sa vyhodnotenie ĝ spolieha na čoraz kratšie vzdialenosti a šum narastá.  
+  
+Crossing/lost:  
+- CROSS_DEBOUNCE_M (2): minimálna dráha medzi akceptovanými crossingmi. Ak CROSS správy prichádzajú v skupinkách tesne za sebou (šumový prechod), zvýšiť. Ak reálny crossing nestíha debounce a prepožičiava sa, znížiť — ale pod 1 m to stratí zmysel.  
+- CROSS_LOST_DIST_M (20): dráha bez crossingu, po ktorej sa vyhlási stratená izobata a re-survey. Pozorovanie: ak loď beží tangentom dlho a re-survey sa nikdy nespustí, zvýšiť; ak sa re-survey spúšťa aj pri normálnom sledovaní, znížiť. Závisí od ĝ: na plochom dne crossingov niet, takže prah musí byť ≥ ~2× typická perióda.  
+  
+COG / drift:  
+- COG_MIN_SPEED_MS (0.15): pod touto rýchlosťou je EKF COG nedefinovaný a tangent update sa vypne. Nemeň nad 0,3 — pri pomalom plavbe s krabom uhlem COG je jediný zmysluplný zdroj.  
+- SLOPE_UPD_MIN_DIST_M (4): dráha medzi ĝ-updatemi. Rovnaké ako DEPTH_SLOPE_MIN_DIST_M — ak ĝ skáče pri g_meas, zvýšiť; ak ĝ reaguje pomaly na zmenu svahu, znížiť.  
+- SLOPE_EMA (0.3): vyhladzovanie ĝ — väčšie = rýchlejšia reakcia, menšie = stabilnejšie. Pri konzistentnom svahu kde ĝ skáče: znížiť. Pri postupnom zhoršovaní svahu kde ĝ zaostáva: zvýšiť.  
+- SLOPE_DECAY (0.7): pokles ĝ za periódu bez excitácie. Pilovitý priebeh ĝ na svahu = zvýšiť na 0,8–0,85. Príliš pomalý pokles (loď drží vysoký ĝ aj po prechode na ložinu a eLat diverguje) = znížiť.  
+  
+Recovery:  
+- HOLD_MS po recovery: čas čakania po strate DPT pred re-circle. Ak sonar sa vracia rýchlo a loď zbytočne čaká, znížiť; ak sa spúšťa príliš skoro (DPT výpadok je šum), zvýšiť.  
+  
+TICK_DIST_MAX_M (5): spike-guard na polohu — neladiť, má kryť ojedinelé skoky GPS; ak reálne krabe uhly pri 1 Hz DPT ho prekračujú, zvýšiť na 10.  
