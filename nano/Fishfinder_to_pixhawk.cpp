@@ -1285,12 +1285,12 @@ static void handleLoiterWpResetState(uint32_t now, bool rmbFresh) {
         } else {
             requestModeChange(ROVER_MODE_LOITER, now);
         }
-    } else if (rmbFresh) {
+    } else if (rmbFresh && haveDPT) {
         if (requestModeChange(ROVER_MODE_GUIDED, now)) {
             navState = NavState::GUIDED;
             speedNeedsResend = true;
         }
-    } else if ((now - loiterStartMs) >= LOITER_RESET_MS) {
+    } else if ((now - loiterStartMs) >= LOITER_RESET_MS && haveDPT) {
         if (requestModeChange(ROVER_MODE_GUIDED, now)) {
             navState = NavState::GUIDED;
             waypointReset = true;
@@ -1350,7 +1350,7 @@ static void handleContourApproachPhase(uint32_t now) {
             sendVelocityTarget(bearingTangentDeg, fishingSpeed);
         }
     } else {
-        sendVelocityTarget(contourHeadingDeg, fishingSpeed);
+        sendVelocityTarget(contourHeadingDeg, haveCurrentPos ? fishingSpeed : 0.0f);
     }
 }
 
@@ -1584,7 +1584,7 @@ static void handleContourSurveyPhase(uint32_t now) {
             }
         }
     } else {
-        sendVelocityTarget(contourHeadingDeg, fishingSpeed);
+        sendVelocityTarget(contourHeadingDeg, haveCurrentPos ? fishingSpeed : 0.0f);
     }
 }
 
