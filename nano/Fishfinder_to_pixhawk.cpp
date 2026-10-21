@@ -495,6 +495,7 @@ static void handleRMB(char* fields[], uint8_t n) {
         bool isResume = isOriginStart
             && lastLoiterResetDestId[0] != '\0'
             && (strncmp(fields[5], lastLoiterResetDestId, sizeof(lastLoiterResetDestId) - 1) == 0);
+        lastLoiterResetDestId[0] = '\0';   // consume: stale resume flag nesmie prezit do dalsich tras
 
         strncpy(prevDestWpId, fields[5], sizeof(prevDestWpId) - 1);
         prevDestWpId[sizeof(prevDestWpId) - 1] = '\0';
@@ -983,6 +984,7 @@ static void setCircleAnchor(float lat, int32_t lat_int, int32_t lon_int, float h
     crossSinceLast_m = 0.0f;
     excitAccum_m = 0.0f;
     ditherPhaseRad = 0.0f;
+    followReturnLeg = false;
 
 #if DEBUG_FREE_RAM
     checkFreeRam('G');
@@ -1249,8 +1251,7 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
     } else if (!waypointReset && rmbEverActive) {
         if (contourTrigger && haveDPT && haveCurrentPos &&
             haveLastLegHeading && (havePixhawkHeading || havePixhawkCog) &&
-            rmbArrived && firstArrivedMs &&
-            (now - firstArrivedMs) > (uint32_t)learnedArrivedHoldMs + 100UL) {
+            rmbArrived) {
             enterContourFollow();
         } else if (pixhawkMode == ROVER_MODE_HOLD) {
             // Guard: Intentionally do nothing to prevent LOITER reset while in HOLD mode
@@ -1264,10 +1265,8 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
             //  && elapsed > learnedArrivedHoldMs+100 && DPT && pos && leg && hdg)
             if (!contourTrigger)
                 sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER (no trg)"));
-            else if (!rmbArrived || !firstArrivedMs)
+            else if (!rmbArrived)
                 sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER (no A)"));
-            else if ((now - firstArrivedMs) <= (uint32_t)learnedArrivedHoldMs + 100UL)
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER (hold)"));
             else if (!haveDPT)
                 sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER (no DPT)"));
             else if (!haveCurrentPos)
@@ -1699,7 +1698,7 @@ static void handleContourFollowPhase(uint32_t now) {
                 float dd = depth_m - slopePrevDepth;
                 if (fabsf(dd) >= SLOPE_DEPTH_MIN_M && dPerp >= SLOPE_MIN_PERP_M) {
                     float gMeas = fabsf(dd) / dPerp;
-                    if (!followSlopeValid) followSlope = gMeas;
+                    if (!followSlopeValid) followSlope = fminf(gMeas, 0.5f);
                     else followSlope = SLOPE_EMA * gMeas + (1.0f - SLOPE_EMA) * followSlope;
                     followSlopeValid = (followSlope >= FOLLOW_SLOPE_MIN);
                     excitAccum_m = 0.0f;
