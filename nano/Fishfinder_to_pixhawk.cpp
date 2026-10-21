@@ -83,8 +83,7 @@ static mavlink_message_t mavMsg;
 // Timeouts for declaring NMEA data stale
 #define RMB_TIMEOUT_MS 3000UL // can be lowered for helix dont change for 598ci HD
 #define VTG_TIMEOUT_MS 3000UL
-#define COG_MIN_SPEED_KN 1.0f   // pod touto rychlostou (kn) je COG sum -> filtr zamrzne ako invalid
-#define COG_FILT_ALPHA 0.3f     // EMA vaha noveho COG vzorku; pri konstantnom kurze nulovy fazovy posun
+#define COG_MIN_SPEED_MS 0.15f  // pod touto EKF rychlostou (m/s) je COG nedefinovany -> invalid
 #define DPT_TIMEOUT_MS 3000UL
 
 // Glitch filter for Depth (DPT) data to reject sudden anomalous sonar readings
@@ -239,13 +238,12 @@ static float lastLegHeadingDeg = 0.0f;       // Desired course towards WP
 static bool haveLastLegHeading = false;      // RMB valid course parsed
 static bool followTriggeredForDest = false;  // Contour activation lock
 
-// vtg* Subsystem (NMEA Course/Speed)
+// vtg* Subsystem (NMEA Course/Speed) — len krizova kontrola, riadenie ide z Pixhawk EKF
 static bool haveVTG = false;                 // Current VTG message valid flag
-static bool haveVTGcog = false;              // Current VTG holds course data
 static float vtg_cog_deg = 0.0f;             // Course over ground (deg)
 static uint32_t lastVTGms = 0;               // Timestamp of last valid VTG
-static float cogFiltDeg = 0.0f;              // EMA-filtrovany COG - jediny zdroj COG smeru pre riadenie
-static bool cogFiltValid = false;            // platny len ked rychlost >= COG_MIN_SPEED_KN
+static float pixhawkCogDeg = 0.0f;           // COG z EKF (atan2(gp.vy,gp.vx)) — jediny COG pre riadenie
+static bool havePixhawkCog = false;          // platny len ked EKF ground speed > COG_MIN_SPEED_MS
 
 // depth*/dpt* Subsystem (Sonar Depth)
 static bool haveDPT = false;                 // Current DPT message valid flag
@@ -570,25 +568,7 @@ static void handleVTG(char* fields[], uint8_t n) {
     lastVTGms = millis();
 
     if (fields[1][0]) {
-        float cogRaw = parseFloat(fields[1]);
-        float spdKn = parseFloat(fields[5]);
-        if (spdKn >= COG_MIN_SPEED_KN) {
-            if (!cogFiltValid) {
-                cogFiltDeg = cogRaw;
-                cogFiltValid = true;
-            } else {
-                float dh = cogRaw - cogFiltDeg;
-                while (dh > 180.0f) dh -= 360.0f;
-                while (dh < -180.0f) dh += 360.0f;
-                cogFiltDeg += COG_FILT_ALPHA * dh;
-                while (cogFiltDeg < 0.0f) cogFiltDeg += 360.0f;
-                while (cogFiltDeg >= 360.0f) cogFiltDeg -= 360.0f;
-            }
-        } else {
-            cogFiltValid = false;   // pomala plavba / drift -> COG je sum
-        }
-        vtg_cog_deg = cogRaw;
-        haveVTGcog = true;
+        vtg_cog_deg = parseFloat(fields[1]);
     }
 	// empty COG field keeps last known value — cleared only by VTG_TIMEOUT_MS
 }
@@ -937,6 +917,18 @@ static void readMAVLink() {
                 } else {
                     havePixhawkHeading = false;
                 }
+
+                // EKF ground velocity -> COG (krab-uhol-aware, vyhladene EKF — ziaden dalsi filter netreba)
+                float vx = gp.vx * 0.01f;
+                float vy = gp.vy * 0.01f;
+                float gs = sqrtf(vx * vx + vy * vy);
+                if (gs > COG_MIN_SPEED_MS) {
+                    pixhawkCogDeg = atan2f(vy, vx) * 57.29577951f;
+                    if (pixhawkCogDeg < 0.0f) pixhawkCogDeg += 360.0f;
+                    havePixhawkCog = true;
+                } else {
+                    havePixhawkCog = false;
+                }
             }
             // Custom metric decoder for observing VESC node status
             if (mavMsg.msgid == MAVLINK_MSG_ID_NAMED_VALUE_FLOAT) {
@@ -981,7 +973,7 @@ static void setCircleAnchor(float lat, int32_t lat_int, int32_t lon_int, float h
 
     // Approximates the center of a tangent circle positioned CONTOUR_CIRCLE_RADIUS_M to the side
     float approachHeadingDeg = havePixhawkHeading ? pixhawkHeadingDeg
-                            : cogFiltValid ? cogFiltDeg
+                            : havePixhawkCog ? pixhawkCogDeg
                             : headingDeg;
     float hr = approachHeadingDeg * (float)M_PI / 180.0f;
     approachCenterLat_int = activationLat_int + (int32_t)((-sinf(hr)) * (CONTOUR_CIRCLE_RADIUS_M * 0.5f) * INT7_PER_METER_LAT);
@@ -1227,7 +1219,7 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
             if (contourTrigger && rmbArrived && firstArrivedMs &&
                 (now - firstArrivedMs) > (uint32_t)learnedArrivedHoldMs + 100UL &&
                 haveDPT && haveCurrentPos && haveLastLegHeading &&
-                (havePixhawkHeading || haveVTGcog)) {
+                (havePixhawkHeading || havePixhawkCog)) {
                 enterContourFollow();
             } else if (contourTrigger && (!haveDPT || !haveVTGcog)) {
                 if (!posTargetSentForDest && sendPositionTarget(rmb_lat, rmb_lon)) {
@@ -1272,7 +1264,7 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
         }
     } else if (!waypointReset && rmbEverActive) {
         if (contourTrigger && haveDPT && haveCurrentPos &&
-            haveLastLegHeading && (havePixhawkHeading || haveVTGcog)) {
+            haveLastLegHeading && (havePixhawkHeading || havePixhawkCog)) {
             enterContourFollow();
         } else if (pixhawkMode == ROVER_MODE_HOLD) {
             // Guard: Intentionally do nothing to prevent LOITER reset while in HOLD mode
@@ -1758,8 +1750,8 @@ static void handleContourFollowPhase(uint32_t now) {
             if (nowBelow != wasBelowTarget && crossSinceLast_m >= CROSS_DEBOUNCE_M) {
                 wasBelowTarget = nowBelow;
                 crossSinceLast_m = 0.0f;
-                if (cogFiltValid) {
-                    float dh = cogFiltDeg - contourBaseHeadingDeg;
+                if (havePixhawkCog) {
+                    float dh = pixhawkCogDeg - contourBaseHeadingDeg;
                     while (dh > 180.0f) dh -= 360.0f;
                     while (dh < -180.0f) dh += 360.0f;
                     contourBaseHeadingDeg += 0.5f * dh;
@@ -1921,8 +1913,6 @@ void loop() {
         lastSend = now;
         if (haveVTG && (now - lastVTGms) >= VTG_TIMEOUT_MS) {
             haveVTG = false;
-            haveVTGcog = false;
-            cogFiltValid = false;
         }
         if (haveDPT && (now - lastDPTms) >= DPT_TIMEOUT_MS) {
             haveDPT = false;
