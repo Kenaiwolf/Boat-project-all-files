@@ -1208,7 +1208,7 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
                     posTargetSentForDest = true;
                 }
             } else {
-                float commandedSpeed = vescNotActive ? 0.0f :
+                float commandedSpeed = (vescNotActive || !haveDPT ) ? 0.0f :
                                        (routeIsMultiWP ? fishingSpeed : travelSpeed);
 
                 if (speedNeedsResend) {
@@ -1869,10 +1869,9 @@ void loop() {
 
         // Unified sonar safety: shallow water OR lost depth => loiter reset.
         // Only when Pixhawk is in GUIDED (MANUAL/RC, HOLD, LOITER reset = skip).
-        // !haveDPT && lastDPTms!=0 = "sonar bezel a zomrel"; nikdy neprisla DPT => no trigger.
+        // Bez DPT sa nenaviguje: chybajuca hlbka alebo plytka voda => reset.
         if (pixhawkModeKnown && pixhawkMode == ROVER_MODE_GUIDED && !holdLatched) {
-            if ((haveDPT && depth_m < CONTOUR_SAFETY_DEPTH_M) ||
-                (!haveDPT && lastDPTms != 0)) {
+            if (!haveDPT || depth_m < CONTOUR_SAFETY_DEPTH_M) {
                 gotoLoiterReset(BC_SONAR_FAIL);
                 sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("SONAR: shallow/lost -> LOITER"));
             }
