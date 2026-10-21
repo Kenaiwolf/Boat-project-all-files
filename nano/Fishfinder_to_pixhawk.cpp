@@ -171,6 +171,7 @@ static mavlink_message_t mavMsg;
 #define BC_FOLLOW_SEND_DONE 16
 #define BC_FOLLOW_REENTER 17
 #define BC_FOLLOW_LOOP_TOP 18
+#define BC_SONAR_FAIL 19
 
 // ---- Debug Flags ----
 // Feature flags to enable or disable MAVLink status text debugging
@@ -289,7 +290,6 @@ static int16_t depthSlopeBufDist[DEPTH_SLOPE_SAMPLES];
 static uint8_t depthSlopeHead = 0;
 static uint8_t depthSlopeCount = 0;
 static float depthSlopeCumDist = 0.0f;
-static bool contourHoldTargetSent = false;
 static float followSlope = 0.0f;
 static bool followSlopeValid = false;
 static float circleBestSlope = 0.0f;
@@ -306,10 +306,6 @@ static int32_t slopePrevLat_int = 0;
 static int32_t slopePrevLon_int = 0;
 static float slopePrevDepth = 0.0f;
 static float slopePrevOffsetDeg = 0.0f;
-static bool depthLost = false;
-#define CONTOUR_DPT_LOSS_MS 4000UL
-static int32_t contourHoldLat_int = 0;
-static int32_t contourHoldLon_int = 0;
 static bool contourLastGoodValid = false;
 static int32_t contourLastGoodLat_int = 0;
 static int32_t contourLastGoodLon_int = 0;
@@ -513,6 +509,7 @@ static void handleRMB(char* fields[], uint8_t n) {
 
     // Check the Arrival flag field
     if (fields[13][0] == 'A') {
+        lastLoiterResetDestId[0] = '\0';   // arrived at WP: pending resume flag has no meaning anymore
         if (!rmbArrived) {
             firstArrivedMs = millis();
             if (haveCurrentPos) {
@@ -601,7 +598,6 @@ static void handleDPT(char* fields[], uint8_t n) {
         depthEma_m = haveDptEma ? (depthEma_m * (1.0f - DPT_EMA_ALPHA) + d * DPT_EMA_ALPHA) : d;
         haveDptEma = true;
     }
-    depthLost = false;
 }
 
 static uint32_t lastNmeaByteMs = 0;
@@ -1304,64 +1300,9 @@ static void handleLoiterWpResetState(uint32_t now, bool rmbFresh) {
     }
 }
 
-// Pauses contour tracking and holds position when DPT data goes stale longer than CONTOUR_DPT_LOSS_MS (4 s)
-static void handleContourDepthLossRecovery(uint32_t now) {
-    bool dptStaleNow = (now - lastDPTms) >= CONTOUR_DPT_LOSS_MS;
-
-    if (dptStaleNow && !depthLost) {
-        depthLost = true;
-        contourHoldTargetSent = false;
-        if (haveCurrentPos) {
-            contourHoldLat_int = currentLat_int;
-            contourHoldLon_int = currentLon_int;
-        }
-#if DEBUG_BREADCRUMB
-        EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_CONTOUR_DEPTH_LOST);
-#endif
-#if DEBUG_APPROACH || DEBUG_SURVEY || DEBUG_FOLLOW
-        sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("CONTOUR: depth lost -> hold"));
-#endif
-    } else if (!dptStaleNow && depthLost) {
-        depthLost = false;
-        followSlopeValid = false;
-        crossSinceLast_m = 0.0f;
-        excitAccum_m = 0.0f;
-        if (haveCurrentPos) {
-            int32_t tLat, tLon;
-            transducerPos(currentLat_int, currentLon_int, tLat, tLon);
-            prevPosLat_int = tLat; prevPosLon_int = tLon;
-            slopePrevLat_int = tLat; slopePrevLon_int = tLon;
-            slopePrevOffsetDeg = lastContourOffsetDeg;
-            if (haveDPT) slopePrevDepth = depth_m;
-        }
-        if (contourPhase == ContourPhase::CIRCLE_SURVEY) {
-            contourPhase = ContourPhase::CIRCLE_APPROACH;
-        }
-        if (contourPhase == ContourPhase::CIRCLE_APPROACH) {
-            circleCrossFound = false;
-            circleBestDev = 999.0f;
-            circleAccumAngle = 0.0f;
-            depthSlopeHead = 0;
-            depthSlopeCount = 0;
-            depthSlopeCumDist = 0.0f;
-            surveyDptWasValid = false;
-            sendSpeedCommand(fishingSpeed);
-        }
-#if DEBUG_BREADCRUMB
-        EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_CONTOUR_DEPTH_RECOVERED);
-#endif
-#if DEBUG_APPROACH || DEBUG_SURVEY || DEBUG_FOLLOW
-        sendStatusText_P(MAV_SEVERITY_INFO, PSTR("CONTOUR: depth back ->  recircle"));
-#endif
-    }
-}
-
 // First phase of contour logic: Steers the vessel into a tangent approach circle trajectory
 static void handleContourApproachPhase(uint32_t now) {
-    if (haveDPT && depth_m < CONTOUR_SAFETY_DEPTH_M) {
-        gotoLoiterReset(BC_LOITER_WP_RESET_APPROACH);
-        sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("CONTOUR: shallow depth -> LOITER (approach)"));
-    } else if (haveCurrentPos && activationPosValid) {
+    if (haveCurrentPos && activationPosValid) {
         float cosLat = activationCosLat;
         float dN = (currentLat_int - approachCenterLat_int) * METERS_PER_INT7_LAT;
         float dE = (currentLon_int - approachCenterLon_int) * METERS_PER_INT7_LAT * cosLat;
@@ -1415,10 +1356,7 @@ static void handleContourApproachPhase(uint32_t now) {
 
 // Second phase of contour logic: Executes a full circle, logging bathymetry slope to find optimal starting vector
 static void handleContourSurveyPhase(uint32_t now) {
-    if (haveDPT && depth_m < CONTOUR_SAFETY_DEPTH_M) {
-        gotoLoiterReset(BC_LOITER_WP_RESET_SURVEY);
-        sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("CONTOUR: shallow depth -> LOITER (survey)"));
-    } else if (haveCurrentPos && activationPosValid) {
+    if (haveCurrentPos && activationPosValid) {
         bool posIsNew = (currentLat_int != circlePrevLat_int) || (currentLon_int != circlePrevLon_int);
         float cosLat = activationCosLat;
         float dN = (currentLat_int - activationLat_int) * METERS_PER_INT7_LAT;
@@ -1652,10 +1590,7 @@ static void handleContourSurveyPhase(uint32_t now) {
 
 // Third phase: lateral regulation e_lat = error/g, adaptive S-dither, crossing detection
 static void handleContourFollowPhase(uint32_t now) {
-    if (haveDPT && depth_m < CONTOUR_SAFETY_DEPTH_M) {
-        gotoLoiterReset(BC_LOITER_WP_RESET_FOLLOW);
-        sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("CONTOUR: shallow depth -> LOITER (follow)"));
-    } else {
+    {
 #if DEBUG_BREADCRUMB
         EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_FOLLOW_LOOP_TOP);
 #endif
@@ -1816,7 +1751,6 @@ static void handleContourFollowPhase(uint32_t now) {
 
 // Top-level delegator function distributing logic ticks based on the active ContourPhase
 static void handleContourFollowState(uint32_t now, bool rmbFresh) {
-    handleContourDepthLossRecovery(now);
 
     if (rmbFresh && !rmbArrived) {
         if (requestModeChange(ROVER_MODE_GUIDED, now)) {
@@ -1850,15 +1784,6 @@ static void handleContourFollowState(uint32_t now, bool rmbFresh) {
         contourTrigger = false;
         rmbArrived = false;
         speedNeedsResend = true;
-    } else if (depthLost) {
-        if (haveCurrentPos) {
-            if (!contourHoldTargetSent) {
-                sendPositionTarget(contourHoldLat_int, contourHoldLon_int);
-                contourHoldTargetSent = true;
-            }
-        } else {
-            sendVelocityTarget(contourHeadingDeg, 0.0f);
-        }
     } else if (contourPhase == ContourPhase::CIRCLE_APPROACH) {
         handleContourApproachPhase(now);
     } else if (contourPhase == ContourPhase::CIRCLE_SURVEY) {
@@ -1940,6 +1865,17 @@ void loop() {
             dptGlitchCount = 0;
 #endif
             circleLastDepth = contourTargetDepth_m;
+        }
+
+        // Unified sonar safety: shallow water OR lost depth => loiter reset.
+        // Only when Pixhawk is in GUIDED (MANUAL/RC, HOLD, LOITER reset = skip).
+        // !haveDPT && lastDPTms!=0 = "sonar bezel a zomrel"; nikdy neprisla DPT => no trigger.
+        if (pixhawkModeKnown && pixhawkMode == ROVER_MODE_GUIDED && !holdLatched) {
+            if ((haveDPT && depth_m < CONTOUR_SAFETY_DEPTH_M) ||
+                (!haveDPT && lastDPTms != 0)) {
+                gotoLoiterReset(BC_SONAR_FAIL);
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("SONAR: shallow/lost -> LOITER"));
+            }
         }
 
         bool rmbFresh = rmbActive && ((now - lastRMBms) < RMB_TIMEOUT_MS);
