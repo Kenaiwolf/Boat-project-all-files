@@ -1,0 +1,34 @@
+Ladivý postup — v poradí, v akom fyzicky nastávajú
+Fáza 1: Kvalita DPT vstupu (survey aj follow)
+Sleduj DPT glitch správy. Ak ich vidíš často (>1 za minútu), hĺbkový signál je šumivý — neladí ďalej, lebo celý ĝ-odhad stojí na DPT. Príčina: kábel, rustina vody, alebo DPT_GLITCH prahy. Stabilný DPT = nula týchto správ.
+
+Fáza 2: Survey → vstup do follow
+Sleduj SURV xdev/xslope a FOLLOW g=.
+
+g pri vstupe ≈ sklon dna. Typicky 0,05–0,5. Ak g=0 → survey nenašla crossing (ložina) alebo SLOPE_DEPTH_MIN_M prerezal všetko → kontroluj xslope pri crossingoch: ak je <30 mm/m, dno je naozaj ploché a follow s tangentom je správne správanie.
+g=<minmax> v správe = slope sa vzal z min/max odhadom, nie z crossing merania — ok, ale menej presné.
+Ak FOLLOW g= správa nepríde vôbec → survey kruh sa nedokončil (problém inde — navigácia, nie tuning).
+Fáza 3: Ustálené vlnenie
+Sleduj g_meas (pozitívne updatey) vs SLOPE decay:
+
+Samé g_meas, ĝ stabilné — ideálny stav, dither dodáva excitáciu, odhad žije. Nerob nič.
+Samé SLOPE decay opakovane — dither neprodukuje merateľnú Δhĺbku. Príčiny: dno naozaj ploché (ĝ sa postupne stlačí pod 0,17 → slopeTooFlat → tangent-only mód, korektné), alebo excitAccum nikdy nedosiahne 12 m (loď stojí — krab/drift).
+g_meas a decay sa striedajú (pilovitý ĝ) — SLOPE_DECAY 0.7 je príliš agresívny → zdvihni na 0,8–0,85. To je presne ten ladivý signál, pre ktorý bola decay diagnostika vymyslená.
+g_meas s vysokými exc hodnotami a ĝ skáče — slope update reaguje na šum; skontroluj SLOPE_UPD_MIN_DIST_M (4 m) či nie je krátky.
+Fáza 4: Crossingy a tangent
+Sleduj CROSS lat/heading/dog:
+
+Crossingy by mali prichádzať ~každých 6 m (pol-perióda) pri bežiacom ditheri. Ak ich nie je a crossSinceLast rastie do 20 m → reenter → to je „lost" správanie.
+dg= (drift gate) ukazuje, koľko vzoriek COG bralo tangent update — pri slabej GPS presnosti rastie.
+Ak crossingy prichádzajú, ale heading v CROSS správe systematic driftuje do strany → contourBaseHeadingDeg blend táha zle → problém je v COG kvalite pri fishing speed, nie v konštantách.
+Fáza 5: Hraničné režimy
+Prechod svah→ložina: sleduj, či decay kaskáduje (ĝ → 0, slopeTooFlat → tangent) a loď sa vráti cez re-survey až keď izobata „zanikne" — nie okamžite.
+Návrat po strate hĺbky: recovery → re-circle → nové FOLLOW g= — porovnaj s predošlým ĝ; konzistentné hodnoty = survey opakovateľný.
+Súhrn ladivých rozhodnutí
+Symptóm	Kde vidno	Konštanta
+ĝ sa rozpadá aj na svahu	SLOPE decay často	SLOPE_DECAY ↑ 0.8
+Dither príliš široký/úzky	latAmp saturácia	DITHER_DEPTH_M
+Priveľa re-survey	REENTER správy	CROSS_LOST_DIST_M ↑
+Falošné crossingy	CROSS tesno po sebe	CROSS_DEBOUNCE_M ↑
+Follow diverguje pri vstupe	eL v g_meas rastie	prior ĝ zo survey zlý → circleBestSlope
+Prvá vec pri ladení: nechať bežať 2–3 survey cykly a len zbierať správy — neladiť po prvom behu, lebo jediný odhad ĝ bez kontextu nepovie, či je chyba v konštante alebo v teréne.
