@@ -79,7 +79,7 @@ static mavlink_message_t mavMsg;
 
 // Timer intervals for sending data (in milliseconds)
 #define HB_INTERVAL_MS 1000UL
-#define SEND_INTERVAL_MS 1000UL
+#define SEND_INTERVAL_MS 200UL
 // Timeouts for declaring NMEA data stale
 #define RMB_TIMEOUT_MS 3000UL // can be lowered for helix dont change for 598ci HD
 #define COG_MIN_SPEED_MS 0.15f  // pod touto EKF rychlostou (m/s) je COG nedefinovany -> invalid
