@@ -22,7 +22,7 @@
 #include "conf_general.h"
 #include "utils_math.h"
 #include "utils_sys.h"
-#include "datatypes.h"  // for eeprom_var    
+#include "datatypes.h"  // for eeprom_var
 #include <string.h>    // for strcmp in terminal_kenai_debug
 
 // Custom EEPROM slot (0..127 valid, see EEPROM_VARS_CUSTOM) used to persist the
@@ -50,35 +50,97 @@
 #define MIN_VALID_SPAN_DEG 10.0f
 
 // ACTIVE-only no-hall runaway guard: high current + large persistent error + frozen encoder.
-#define NO_HALL_CURRENT_THRESH_A 3.0f
-#define NO_HALL_ERROR_THRESH_DEG 5.0f
-#define NO_HALL_POS_EPS_DEG      0.1f
-#define NO_HALL_TIME_S           0.5f
+// All three conditions below must hold simultaneously (AND'd) for no_hall_timer to accumulate —
+// see the check at line ~949. Loosening = making ANY of the three harder to satisfy at once.
+#define NO_HALL_CURRENT_THRESH_A 3.0f   // (A) min total current to even consider a hall fault.
+                                         // DO NOT raise — this must stay low enough to catch a
+                                         // real stall during HOMING too, where this guard is the
+                                         // primary protection against a disconnected/failed hall.
+#define NO_HALL_ERROR_THRESH_DEG 8.0f   // (deg) min |target - actual| position error. Raised from
+                                         // 5.0 -> 8.0: requires a bigger real steering discrepancy
+                                         // before suspecting hall failure. This is the main lever
+                                         // for reducing cavitation/load false-triggers — unlike
+                                         // POS_EPS_DEG, it's not limited by encoder noise floor.
+#define NO_HALL_POS_EPS_DEG      0.1f   // (deg) max encoder movement between ticks to count as
+                                         // "frozen". Left unchanged — already near its practical
+                                         // floor (encoder jitter/noise); lowering further risks the
+                                         // guard never firing even on a genuine hall failure.
+#define NO_HALL_TIME_S           0.5f   // (s) how long all 3 conditions must hold continuously.
+                                         // Left unchanged — longer dwell time = longer the actuator
+                                         // can push against a real hard stop before failsafe engages.
 
 // FAILSAFE reason codes — persisted to EEPROM slot KENAI_EEPROM_ADDR_FAILSAFE.
 // HW faults are stored in the same slot as (100 + mc_fault_code).
 #define FAILSAFE_REASON_NONE         0
 #define FAILSAFE_REASON_UART_TIMEOUT 1
-#define FAILSAFE_REASON_NO_HALL      2    
-  
-// Debug printf gate — default OFF. Enabled only via "kenai_debug 1" terminal cmd.  
-// RAM flag, always resets to 0 on boot — safe in field operation.  
-static volatile bool kenai_debug_verbose = false;  
+#define FAILSAFE_REASON_NO_HALL      2
+
+// EEPROM word layout: bits [0:7] = code (0/1/2 = FAILSAFE_REASON_*, >=100 = 100+mc_fault_code),
+// bits [8:31] = seconds-since-boot at the time this code was written (24-bit, ~194 days range).
+// Packed into the existing 32-bit slot — no extra EEPROM address, no extra flash write/incident.
+#define KENAI_FAILSAFE_CODE_MASK  0xFFu
+#define KENAI_FAILSAFE_TIME_SHIFT 8u
+
+// Any HW/failsafe code that fires within this many seconds of boot is assumed to be a
+// power-up transient (cap charging, ADC offset not yet settled, DRV glitch, etc.) and is
+// NOT persisted — it would otherwise clobber the real root cause of a previous incident.
+// FAULT_CODE_BOOTING_FROM_WATCHDOG_RESET is the sole exception: it is itself only ever
+// detected in this same early window and is the one signal we actually want to survive
+// a reboot (it tells us a frozen thread caused an IWDG reset).
+#define KENAI_BOOT_FAULT_SUPPRESS_S 30.0f
+
+// Set once at the top of app_custom_start(). Used to timestamp stored faults and to
+// gate the boot-suppress window above.
+static systime_t kenai_boot_time;
+
+// Debug printf gate — default OFF. Enabled only via "kenai_debug 1" terminal cmd.
+// RAM flag, always resets to 0 on boot — safe in field operation.
+static volatile bool kenai_debug_verbose = false;
 #define KPRINTF(...) do { if (kenai_debug_verbose) commands_printf(__VA_ARGS__); } while (0)
 
-// Only write to EEPROM if value actually changed, to avoid unnecessary flash wear.
+// Only write to EEPROM if the code actually changed, to avoid unnecessary flash wear.
+// Packs the current seconds-since-boot into the upper bits alongside the code.
 static void kenai_store_failsafe_reason_if_changed(uint8_t reason) {
     eeprom_var v_old;
     bool have_old = conf_general_read_eeprom_var_custom(&v_old, KENAI_EEPROM_ADDR_FAILSAFE);
-    if (!have_old || v_old.as_u32 != (uint32_t)reason) {
-        eeprom_var v_new; v_new.as_u32 = (uint32_t)reason;
+    uint8_t old_code = have_old ? (uint8_t)(v_old.as_u32 & KENAI_FAILSAFE_CODE_MASK) : 0xFFu;
+    if (!have_old || old_code != reason) {
+        uint32_t secs_since_boot = (uint32_t)(ST2S(chVTTimeElapsedSinceX(kenai_boot_time)));
+        eeprom_var v_new;
+        v_new.as_u32 = ((uint32_t)reason & KENAI_FAILSAFE_CODE_MASK) |
+                       (secs_since_boot << KENAI_FAILSAFE_TIME_SHIFT);
         conf_general_store_eeprom_var_custom(&v_new, KENAI_EEPROM_ADDR_FAILSAFE);
     }
 }
 
 // Stores last HW fault as (100 + fault_code) in the same EEPROM slot.
 // Called from fault_stop_thread in mc_interface.c — non-static on purpose.
+//
+// Faults within KENAI_BOOT_FAULT_SUPPRESS_S of boot are treated as power-up transients
+// and are not persisted, since they would clobber the real root cause of a prior incident.
+// This supersedes the old ABS_OVER_CURRENT-only exclusion (commit c8546183): that code
+// is now just one instance of the broader "boot transient" category covered here.
+// FAULT_CODE_BOOTING_FROM_WATCHDOG_RESET is exempt, since it is the one fault we want to
+// survive specifically because it always occurs in this same early window.
 void kenai_store_last_hw_fault(mc_fault_code code) {
+    if (code != FAULT_CODE_BOOTING_FROM_WATCHDOG_RESET) {
+        float elapsed_s = (float)ST2MS(chVTTimeElapsedSinceX(kenai_boot_time)) / 1000.0f;
+        if (elapsed_s < KENAI_BOOT_FAULT_SUPPRESS_S) {
+            return;
+        }
+    }
+
+    // UNDER_VOLTAGE fires on every normal power-down (caps discharging), not during real
+    // operation. Only persist it if the unit was actually driving (ACTIVE) or still homing
+    // at the moment power dropped — a routine shutdown from STOWED/IDLE must write nothing,
+    // otherwise this slot can never be cleared via terminal: the next power-off would just
+    // re-write UNDER_VOLTAGE again even though nothing went wrong.
+    if (code == FAULT_CODE_UNDER_VOLTAGE) {
+        if (servo_state != SERVO_STATE_ACTIVE && servo_state != SERVO_STATE_HOMING) {
+            return;
+        }
+    }
+
     kenai_store_failsafe_reason_if_changed(100 + (uint8_t)code);
 }
 
@@ -159,9 +221,11 @@ static volatile bool stow_requested    = false;
 static volatile bool stowed_reached = false;
 static volatile bool in_deadband = false;
 static volatile bool homing_completed  = false;
-static volatile bool no_hall_fault_latched = false;  // latched FAILSAFE cause — cleared only by kenai_stop
+static volatile bool no_hall_fault_latched = false;  // latched FAILSAFE cause — auto-clears after grace period (see FAILSAFE case)
 static volatile uint8_t failsafe_reason = FAILSAFE_REASON_NONE;  // last FAILSAFE cause, reported via MSG_GET_STATE
+static volatile uint8_t pending_failsafe_reason = FAILSAFE_REASON_NONE;  // deferred EEPROM-write payload — set in hot path, written one tick later in FAILSAFE case body
 static float no_hall_timer = 0.0f;  // ACTIVE-only accumulator for no-hall runaway guard
+static float no_hall_recover_timer = 0.0f;  // FAILSAFE-only accumulator for no-hall latch auto-clear
 
 static volatile float homing_timer = 0.0f;
 static volatile float stall_timer  = 0.0f;
@@ -190,22 +254,22 @@ static void terminal_kenai_state(int argc, const char **argv);
 static void terminal_kenai_deploy(int argc, const char **argv);
 static void terminal_kenai_stow(int argc, const char **argv);
 static void terminal_kenai_angle(int argc, const char **argv);
-static void terminal_kenai_debug(int argc, const char **argv) {  
-    if (argc == 2) {  
-        kenai_debug_verbose = (strcmp(argv[1], "1") == 0 || strcmp(argv[1], "on") == 0);  
-    }  
-    commands_printf("Kenai: debug_verbose = %d\n", (int)kenai_debug_verbose);  
-}  
-  
+static void terminal_kenai_debug(int argc, const char **argv) {
+    if (argc == 2) {
+        kenai_debug_verbose = (strcmp(argv[1], "1") == 0 || strcmp(argv[1], "on") == 0);
+    }
+    commands_printf("Kenai: debug_verbose = %d\n", (int)kenai_debug_verbose);
+}
+
 static void terminal_kenai_stop(int argc, const char **argv) {
     (void)argc; (void)argv;
     deploy_requested = false;
     stow_requested   = false;
-    no_hall_fault_latched = false;  // manual override — required to clear the no-hall latch
-    failsafe_reason  = FAILSAFE_REASON_NONE;    
-    servo_state      = SERVO_STATE_IDLE;    
-    mc_interface_release_motor();    
-    kenai_store_failsafe_reason_if_changed(FAILSAFE_REASON_NONE);  // clear persisted state  
+    no_hall_fault_latched = false;  // clears automaticaly after 5 sec
+    failsafe_reason  = FAILSAFE_REASON_NONE;
+    servo_state      = SERVO_STATE_IDLE;
+    mc_interface_release_motor();
+    kenai_store_failsafe_reason_if_changed(FAILSAFE_REASON_NONE);  // clear persisted state
     commands_printf("Kenai: STOP → IDLE, motor released.\n FS status cleaned");
 }
 
@@ -316,22 +380,23 @@ void app_custom_start(void) {
             "",
             terminal_kenai_stop);
 
-    terminal_register_command_callback(  
-            "kenai_set_stops",  
-            "Manually set hard stop angles, skips homing (for debugging).",  
-            "kenai_set_stops [stop1_deg] [stop2_deg] for example(45 315) ",  
-            terminal_kenai_set_stops);  
-  
-    terminal_register_command_callback(  
-            "kenai_debug",  
-            "Toggle verbose debug printf from control thread.",  
-            "kenai_debug [0|1]",  
+    terminal_register_command_callback(
+            "kenai_set_stops",
+            "Manually set hard stop angles, skips homing (for debugging).",
+            "kenai_set_stops [stop1_deg] [stop2_deg] for example(45 315) ",
+            terminal_kenai_set_stops);
+
+    terminal_register_command_callback(
+            "kenai_debug",
+            "Toggle verbose debug printf from control thread.",
+            "kenai_debug [0|1]",
             terminal_kenai_debug);
 
     // No EEPROM restore — always boot to SERVO_STATE_IDLE (its default init value).
     // Encoder is incremental (hall A/B), so nothing meaningful survives a power cycle
     // anyway; a fresh deploy/homing is always required after boot regardless.
-    last_cmd_time = chVTGetSystemTimeX();
+    kenai_boot_time = chVTGetSystemTimeX();
+    last_cmd_time = kenai_boot_time;
     cmd_received_ever = false;
 
     stop_now = false;
@@ -341,14 +406,19 @@ void app_custom_start(void) {
     {
         eeprom_var v;
         if (conf_general_read_eeprom_var_custom(&v, KENAI_EEPROM_ADDR_FAILSAFE)) {
-            if (v.as_u32 >= 100) {
-                commands_printf("Kenai: last fault before this boot: %s",
-                        mc_interface_fault_to_string((mc_fault_code)(v.as_u32 - 100)));
+            uint8_t stored_code = (uint8_t)(v.as_u32 & KENAI_FAILSAFE_CODE_MASK);
+            uint32_t stored_secs = v.as_u32 >> KENAI_FAILSAFE_TIME_SHIFT;
+            if (stored_code >= 100) {
+                commands_printf("Kenai: last fault before previous boot: %s (occurred %lu s after that boot)",
+                        mc_interface_fault_to_string((mc_fault_code)(stored_code - 100)),
+                        (unsigned long)stored_secs);
             } else {
-                commands_printf("Kenai: last saved failsafe_reason before this boot = %d", (int)v.as_u32);
+                commands_printf("Kenai: last saved failsafe_reason before previous boot = %d (occurred %lu s after that boot)",
+                        (int)stored_code, (unsigned long)stored_secs);
             }
         }
     }
+
 
     chThdCreateStatic(control_thread_wa, sizeof(control_thread_wa),
             NORMALPRIO, control_thread, NULL);
@@ -364,7 +434,7 @@ void app_custom_stop(void) {
     terminal_unregister_callback(terminal_kenai_stow);
     terminal_unregister_callback(terminal_kenai_angle);
     terminal_unregister_callback(terminal_kenai_stop);
-    terminal_unregister_callback(terminal_kenai_set_stops);  
+    terminal_unregister_callback(terminal_kenai_set_stops);
     terminal_unregister_callback(terminal_kenai_debug);
 
     stop_now = true;
@@ -609,7 +679,7 @@ static THD_FUNCTION(control_thread, arg) {
                 homing_phase_prev_pos = pos_now;
 
                 if (homing_traveled_deg > homing_max_travel_deg && homing_phase != HOMING_PHASE_RETURN_TO_START) {
-                    KPRINTF("Kenai: HOMING ABORT — traveled %.1f deg, returning to start",  
+                    KPRINTF("Kenai: HOMING ABORT — traveled %.1f deg, returning to start",
                                     (double)homing_traveled_deg);
                     mc_interface_set_current(0.0f);
                     // Latch direction/distance BEFORE overwriting homing_phase — see timeout branch above.
@@ -659,10 +729,10 @@ static THD_FUNCTION(control_thread, arg) {
                             if (movement >= 5.0f) {
                                 encoder_inverted = (utils_angle_difference(stop1_angle, pos_at_homing_start) < 0.0f);
                                 enc_dir_detected = true;
-                                KPRINTF("Kenai: Stop1=%.1f enc_inverted=%d (from stop1 move %.1f deg)",  
+                                KPRINTF("Kenai: Stop1=%.1f enc_inverted=%d (from stop1 move %.1f deg)",
                                         (double)stop1_angle, (int)encoder_inverted, (double)movement);
                             } else {
-                                KPRINTF("Kenai: Stop1=%.1f moved only %.1f deg — deferring direction detect to stop2",  
+                                KPRINTF("Kenai: Stop1=%.1f moved only %.1f deg — deferring direction detect to stop2",
                                         (double)stop1_angle, (double)movement);
                             }
                         }
@@ -710,7 +780,7 @@ static THD_FUNCTION(control_thread, arg) {
                         if (!enc_dir_detected) {
                             encoder_inverted = (utils_angle_difference(stop2_angle, stop1_angle) > 0.0f);
                             enc_dir_detected = true;
-                            KPRINTF("Kenai: enc_inverted=%d (from stop2 move — motor started at stop1)",  
+                            KPRINTF("Kenai: enc_inverted=%d (from stop2 move — motor started at stop1)",
                                     (int)encoder_inverted);
                         }
 
@@ -735,9 +805,8 @@ static THD_FUNCTION(control_thread, arg) {
                         // Invalid span (hall disconnected/frozen encoder => stop1≈stop2≈start) —
                         // latch FAILSAFE instead of publishing a bogus center/entering ACTIVE. A live
                         // UART signal alone (MSG_GET_STATE/MSG_SET_ANGLE) must NOT clear this — the
-                        // fault is the encoder, not comms; only kenai_stop clears no_hall_fault_latched.
                         if (span < MIN_VALID_SPAN_DEG) {
-                            KPRINTF("Kenai: HOMING INVALID — span %.1f deg (<%.1f) — no encoder motion — FAILSAFE",  
+                            KPRINTF("Kenai: HOMING INVALID — span %.1f deg (<%.1f) — no encoder motion — FAILSAFE",
                                     (double)span, (double)MIN_VALID_SPAN_DEG);
                             mc_interface_release_motor();
                             no_hall_fault_latched = true;
@@ -768,7 +837,7 @@ static THD_FUNCTION(control_thread, arg) {
                         if (storage_angle >= 360.0f) storage_angle = 0.0f;  // guard exact-360 edge case
                         homing_completed  = true;
 
-                        KPRINTF("Kenai: Stop2=%.1f  Center=%.1f  Storage=%.1f — ACTIVE",  
+                        KPRINTF("Kenai: Stop2=%.1f  Center=%.1f  Storage=%.1f — ACTIVE",
                                 (double)stop2_angle, (double)center_angle, (double)storage_angle);
 
                         in_deadband       = false;
@@ -806,7 +875,7 @@ static THD_FUNCTION(control_thread, arg) {
                     // phase, see top of block), so it's correct past 180deg/multiple wraps, unlike
                     // utils_angle_difference() on far-apart absolute angles (shortest-path only, <=180deg).
                     if (homing_traveled_deg >= homing_return_distance_deg) {
-                        KPRINTF("Kenai: Returned to start (%.1f/%.1f deg) — IDLE",  
+                        KPRINTF("Kenai: Returned to start (%.1f/%.1f deg) — IDLE",
                                 (double)homing_traveled_deg, (double)homing_return_distance_deg);
                         mc_interface_release_motor();
                         deploy_requested = false;
@@ -923,7 +992,13 @@ static THD_FUNCTION(control_thread, arg) {
                     active_prev_pos   = 0.0f;
                     no_hall_timer     = 0.0f;
                     mc_interface_release_motor();
-                    kenai_store_failsafe_reason_if_changed(failsafe_reason);
+                    // Defer the EEPROM write (can block control_thread for up to 3s inside
+                    // mc_interface_wait_for_motor_release_both() + a chSysLock'd flash erase/write,
+                    // see conf_general.c store_eeprom_var()) out of this hot path. A stalled
+                    // control_thread here stops timeout_feed_WDT(THREAD_APP) and can trigger an
+                    // IWDG reset. Just latch a RAM flag; the actual write happens later, outside
+                    // the critical window, in the FAILSAFE case body below.
+                    pending_failsafe_reason = failsafe_reason;
                     break;
                 }
 
@@ -1006,13 +1081,37 @@ static THD_FUNCTION(control_thread, arg) {
         case SERVO_STATE_FAILSAFE:
             timeout_reset();
 			mc_interface_release_motor();
+            // Perform the deferred EEPROM write here — one tick after the FAILSAFE
+            // transition, after the UART reply for this cycle has already been queued,
+            // so the blocking write doesn't collide with sending the state change to Pixhawk.
+            if (pending_failsafe_reason != FAILSAFE_REASON_NONE) {
+                uint8_t _reason_to_store = pending_failsafe_reason;
+                pending_failsafe_reason = FAILSAFE_REASON_NONE;
+                kenai_store_failsafe_reason_if_changed(_reason_to_store);
+            }
 
-            // Signal restored → back to IDLE — but NOT if latched by the no-hall guard/homing-span
-            // check, since that fault is the encoder, not comms; only kenai_stop clears the latch.
+            // Signal restored → back to IDLE — not latched by comms loss.
             if (!no_signal && !no_hall_fault_latched) {
-                KPRINTF("Kenai: Signal restored — IDLE");
+                commands_printf("Kenai: Signal restored — IDLE");
                 failsafe_reason = FAILSAFE_REASON_NONE;
                 servo_state = SERVO_STATE_IDLE;
+            }
+
+            // NO-HALL latch auto-clears after a grace period instead of requiring kenai_stop —
+            // Pixhawk already detects/logs/disarms on its own offline watchdog (~3s) during this
+            // window, and the exact cause remains recoverable post-mortem via EEPROM fs_reason,
+            // so a permanently stuck state adds outage time without added diagnostic value.
+            if (no_hall_fault_latched) {
+                no_hall_recover_timer += (1.0f / 200.0f); // this loop runs at 200 Hz (5ms sleep)
+                if (no_hall_recover_timer > 5.0f) {
+                    no_hall_fault_latched = false;
+                    no_hall_recover_timer = 0.0f;
+                    commands_printf("Kenai: NO-HALL latch auto-cleared after grace period — IDLE");
+                    failsafe_reason = FAILSAFE_REASON_NONE;
+                    servo_state = SERVO_STATE_IDLE;
+                }
+            } else {
+                no_hall_recover_timer = 0.0f;
             }
             break;
 
@@ -1045,16 +1144,20 @@ static void terminal_kenai_state(int argc, const char **argv) {
     commands_printf("  enc_inverted: %d",        (int)encoder_inverted);
     commands_printf("  no_hall_flt : %d",        (int)no_hall_fault_latched);
     // fs_reason legend: 0=NONE (no failsafe), 1=UART_TIMEOUT (comms lost, auto-recovers on signal),
-    //                    2=NO_HALL (latched HW/encoder fault — requires kenai_stop to clear)
+    //                    2=NO_HALL (latched HW/encoder fault)
     commands_printf("  fs_reason   : %d",        (int)failsafe_reason);
     {
         eeprom_var v;
         if (conf_general_read_eeprom_var_custom(&v, KENAI_EEPROM_ADDR_FAILSAFE)) {
-            if (v.as_u32 >= 100) {
-                commands_printf("  last fault: %s",
-                        mc_interface_fault_to_string((mc_fault_code)(v.as_u32 - 100)));
+            uint8_t stored_code = (uint8_t)(v.as_u32 & KENAI_FAILSAFE_CODE_MASK);
+            uint32_t stored_secs = v.as_u32 >> KENAI_FAILSAFE_TIME_SHIFT;
+            if (stored_code >= 100) {
+                commands_printf("  last fault: %s (at %lu s after boot)",
+                        mc_interface_fault_to_string((mc_fault_code)(stored_code - 100)),
+                        (unsigned long)stored_secs);
             } else {
-                commands_printf("  fs_reason(0=NONE, 1=UART_TIMEOUT, 2=NO_HALL): %d", (int)v.as_u32);
+                commands_printf("  fs_reason(0=NONE, 1=UART_TIMEOUT, 2=NO_HALL): %d (at %lu s after boot)",
+                        (int)stored_code, (unsigned long)stored_secs);
             }
         }
     }
