@@ -1,0 +1,5 @@
+TimeUS,Message
+680199511,SRC=1/191:CONTOUR: lap no cross -> retry
+717019510,SRC=1/191:CONTOUR: survey done -> follow
+758279543,SRC=1/191:CONTOUR: line lost -> re-circle
+758279953,SRC=1/191:CONTOUR FOLLOW: re-activated
