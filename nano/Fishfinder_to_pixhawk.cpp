@@ -234,6 +234,7 @@ static char lastLoiterResetDestId[13] = "";  // ID of WP mapped prior to loiter
 static bool routeIsMultiWP = false;          // True if executing multi-waypoint sequence
 static bool rmbArrived = false;              // Active when reaching WP destination ring
 static bool contourTrigger = false;          // Target transition edge latch
+static bool rmbDestChangedInContour = false;
 static bool rmbSeenNotArrivedForDest = false;// Wait for stable distance before target latch
 static bool posTargetSentForDest = false;    // Has WP target been transmitted
 static float lastLegHeadingDeg = 0.0f;       // Desired course towards WP
@@ -502,6 +503,7 @@ static void handleRMB(char* fields[], uint8_t n) {
 
         rmbArrived = false;
         contourTrigger = false;
+        if (navState == NavState::CONTOUR_FOLLOW) rmbDestChangedInContour = true;
         firstArrivedMs = 0;
         arrivalLat_int = 0;   // sentinel: no valid snapshot for new dest
         arrivalLon_int = 0;
@@ -523,6 +525,7 @@ static void handleRMB(char* fields[], uint8_t n) {
         if (routeIsMultiWP && !followTriggeredForDest && rmbSeenNotArrivedForDest) {
             contourTrigger = true;
             followTriggeredForDest = true;
+            rmbDestChangedInContour = false;
         }
     } else {
         // Transient 'A'->'V' mid-dest (no destChanged): learn window here too
@@ -1752,7 +1755,7 @@ static void handleContourFollowPhase(uint32_t now) {
 // Top-level delegator function distributing logic ticks based on the active ContourPhase
 static void handleContourFollowState(uint32_t now, bool rmbFresh) {
 
-    if (rmbFresh && !rmbArrived) {
+    if (rmbFresh && !rmbArrived && rmbDestChangedInContour) {
         if (requestModeChange(ROVER_MODE_GUIDED, now)) {
 #if DEBUG_GUIDED || DEBUG_APPROACH || DEBUG_SURVEY || DEBUG_FOLLOW
             sendStatusText_P(MAV_SEVERITY_INFO, PSTR("CONTOUR: new dest -> guided"));
