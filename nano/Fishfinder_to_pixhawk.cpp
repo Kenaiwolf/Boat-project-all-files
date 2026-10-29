@@ -1285,24 +1285,28 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
             strncpy(lastLoiterResetDestId, prevDestWpId, sizeof(lastLoiterResetDestId) - 1);
             lastLoiterResetDestId[sizeof(lastLoiterResetDestId) - 1] = '\0';
             gotoLoiterReset(BC_LOITER_WP_RESET_RMB);
-#if DEBUG_GUIDED || DEBUG_APPROACH || DEBUG_SURVEY
-            // Diagnostika: preco sa follow pri utichnuti RMB nespustil
-            // (aktivacia vyzaduje contourTrigger && rmbArrived && firstArrivedMs
-            //  && DPT && pos && leg && hdg)
-            if (!contourTrigger)
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER (no trg)"));
-            else if (!rmbArrived)
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER (no A)"));
-            else if (!haveDPT)
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER (no DPT)"));
-            else if (!haveCurrentPos)
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER (no pos)"));
-            else if (!haveLastLegHeading)
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER (no leg)"));
-            else
-                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> LOITER (no hdg)"));
-#endif
         }
+#if DEBUG_GUIDED || DEBUG_APPROACH || DEBUG_SURVEY
+        else
+        {
+            // Arrived alebo mid-route bez follow-podmienok: LOITER sa nedeje,
+            // diagnostika povie co chyba k enterContourFollow
+            if (!contourTrigger)
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> FOLLOW n/a (no trg)"));
+            else if (!rmbArrived)
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> FOLLOW n/a (no A)"));
+            else if (!haveDPT)
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> FOLLOW n/a (no DPT)"));
+            else if (!haveCurrentPos)
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> FOLLOW n/a (no pos)"));
+            else if (!haveLastLegHeading)
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> FOLLOW n/a (no leg)"));
+            else if (!(havePixhawkHeading || havePixhawkCog))
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> FOLLOW n/a (no hdg)"));
+            else
+                sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("RMB lost -> FOLLOW n/a (wait)"));
+        }
+#endif
     }
 }
 
