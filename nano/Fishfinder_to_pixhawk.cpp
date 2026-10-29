@@ -862,7 +862,7 @@ static void readMAVLink() {
 
                 if (trimState != prevTrimState) {
                     prevTrimState = trimState;
-                    if (trimState != 0 &&
+                    if (trimState != 0 && followReturnLeg != 2 &&
                         (pixhawkMode == ROVER_MODE_GUIDED || pixhawkMode == ROVER_MODE_CIRCLE) &&
                         ((navState == NavState::GUIDED && rmbActive && (millis() - lastRMBms) < RMB_TIMEOUT_MS) || navState == NavState::CONTOUR_FOLLOW)) {
 
@@ -887,8 +887,9 @@ static void readMAVLink() {
                             sendStatusText(MAV_SEVERITY_DEBUG, dbg);
                         }
 #endif
-                        // Send speed immediately if not actively following contour logic which updates continuously
-                        if (navState != NavState::CONTOUR_FOLLOW || pixhawkMode == ROVER_MODE_CIRCLE) {
+                        // Send speed immediately if not actively following contour logic which updates continuously.
+                        // Exception: return leg (faza 1) naviguje cez WP target — vektory speed nenesu, treba explicitnu 178.
+                        if (navState != NavState::CONTOUR_FOLLOW || pixhawkMode == ROVER_MODE_CIRCLE || followReturnLeg == 1) {
                             if (sendSpeedCommand(spd)) {
                                 lastSentSpeed = spd;
                                 lastSpeedSendMs = millis();
