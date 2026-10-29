@@ -298,7 +298,7 @@ static float crossSinceLast_m = 0.0f;      // metres since last accepted crossin
 static float excitAccum_m = 0.0f;
 static bool wasBelowTarget = false;
 static uint8_t followReturnLeg = 0;    // 0=vyp, 1=WP leg na circleBest, 2=pivot na circleBestHeading
-tatic uint8_t pivotTicks = 0;           // ticky fazy 2 (timeout po 150 ~ 30 s)
+static uint8_t pivotTicks = 0;           // ticky fazy 2 (timeout po 150 ~ 30 s)
 static bool returnSpeedSent = false;    // 178 v return legu poslana raz, nie kazdy tick
 static float ditherPhaseRad = 0.0f;
 static int32_t prevPosLat_int = 0;
@@ -1280,8 +1280,7 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
             enterContourFollow();
         } else if (pixhawkMode == ROVER_MODE_HOLD) {
             // Guard: Intentionally do nothing to prevent LOITER reset while in HOLD mode
-        else if (!rmbArrived)
-        {
+        } else if (!rmbArrived) {
             // Store resume identity and initiate loiter-based flush
             strncpy(lastLoiterResetDestId, prevDestWpId, sizeof(lastLoiterResetDestId) - 1);
             lastLoiterResetDestId[sizeof(lastLoiterResetDestId) - 1] = '\0';
