@@ -1331,6 +1331,7 @@ static void handleContourApproachPhase(uint32_t now) {
             contourPhase = ContourPhase::CIRCLE_SURVEY;
             circleSpeedPending = true;
             requestModeChange(ROVER_MODE_CIRCLE, now);
+            if (!vescNotActive) sendSpeedCommand(fishingSpeed);  // 178 hned; dorazi este v GUIDED, nastavi speed_max WP legu — neutralne, lebo WP leg bezi fishingSpeed
 #if DEBUG_BREADCRUMB
             EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_SURVEY_ENTER);
 #endif
