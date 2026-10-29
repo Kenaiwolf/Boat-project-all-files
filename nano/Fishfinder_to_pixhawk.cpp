@@ -120,7 +120,7 @@ static mavlink_message_t mavMsg;
 
 // Operational delays and global scaling factors
 #define LOITER_RESET_MS 1500UL
-#define DEFAULT_SPEED_MS 3.4f
+#define DEFAULT_SPEED_MS 1.0f
 // Conversion factors between degrees and meters for coordinate math
 #define METERS_PER_DEG_LAT 111111.0f
 #define METERS_PER_INT7_LAT (METERS_PER_DEG_LAT * 1e-7f)
@@ -1613,15 +1613,14 @@ static void handleContourFollowPhase(uint32_t now) {
                 if (dNr * dNr + dEr * dEr <= 1.0f) {
                     followReturnLeg = false;   // sme na crossing bode -> normalny follow
                 } else {
-                    contourHeadingDeg = atan2f(dEr, dNr) * 57.29577951f;
-                    if (contourHeadingDeg < 0.0f) contourHeadingDeg += 360.0f;
-                    // referencie posunieme, aby navrat nekontaminoval g-update
-                    prevPosLat_int = slopePrevLat_int = tLat;
-                    prevPosLon_int = slopePrevLon_int = tLon;
-                    slopePrevDepth = depth_m;
-                    slopePrevOffsetDeg = 0.0f;
-                    if (pixhawkModeKnown && pixhawkMode == ROVER_MODE_GUIDED)
-                        sendVelocityTarget(contourHeadingDeg, fishingSpeed);
+                    if (pixhawkModeKnown && pixhawkMode == ROVER_MODE_GUIDED) {
+                        if (sendPositionTarget(circleBestLat_int, circleBestLon_int)) {
+                            prevPosLat_int = slopePrevLat_int = tLat;
+                            prevPosLon_int = slopePrevLon_int = tLon;
+                            slopePrevDepth = depth_m;
+                            slopePrevOffsetDeg = 0.0f;
+                        }
+                    }
                     return;
                 }
             }
