@@ -121,14 +121,11 @@ static mavlink_message_t mavMsg;
 // Operational delays and global scaling factors
 #define LOITER_RESET_MS 1500UL
 #define DEFAULT_SPEED_MS 1.0f
+
 // Conversion factors between degrees and meters for coordinate math
 #define METERS_PER_DEG_LAT 111111.0f
 #define METERS_PER_INT7_LAT (METERS_PER_DEG_LAT * 1e-7f)
 #define INT7_PER_METER_LAT (1.0f / METERS_PER_INT7_LAT)
-
-// Circular surveying and trajectory correction gains
-#define CIRCLE_RADIUS_GAIN 5.0f
-#define CIRCLE_RADIUS_MAX_CORR_DEG 45.0f
 
 // Speed command thresholds and resend delays
 #define SPEED_RESEND_THRESHOLD_MS 0.005f
