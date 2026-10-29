@@ -115,6 +115,7 @@ static mavlink_message_t mavMsg;
 #define CROSS_DEBOUNCE_M 2.0f          // min. draha medzi akceptovanymi crossingmi (m)
 #define CROSS_LOST_DIST_M 20.0f        // draha bez crossing => lost -> reenter + re-survey (m)
 #define TICK_DIST_MAX_M 5.0f           // clamp per-tick vzdialenosti (GPS skok, navrat z outage)
+static_assert(DITHER_PERIOD_M > TICK_DIST_MAX_M, "DITHER_PERIOD_M musi byt > TICK_DIST_MAX_M, inak wrap ditherPhaseRad nestaci");
 #define FOLLOW_UNCERTAIN_CORR_DEG 20.0f// cap korekcie ked g neplatny alebo dno ploché
 #define LEVER_ARM_M 1.865f             // vzdialenost transduceru ZA polohou Pixhawk (m, pozdĺž osi lode)
 
@@ -861,6 +862,7 @@ static void readMAVLink() {
                     prevTrimState = trimState;
                     if (trimState != 0 && followReturnLeg != 2 &&
                         (pixhawkMode == ROVER_MODE_GUIDED || pixhawkMode == ROVER_MODE_CIRCLE) &&
+                        followReturnLeg != 2 &&
                         ((navState == NavState::GUIDED && rmbActive && (millis() - lastRMBms) < RMB_TIMEOUT_MS) || navState == NavState::CONTOUR_FOLLOW)) {
 
                         float &spd = (navState == NavState::GUIDED && !routeIsMultiWP) ? travelSpeed : fishingSpeed;
@@ -885,8 +887,8 @@ static void readMAVLink() {
                         }
 #endif
                         // Send speed immediately if not actively following contour logic which updates continuously.
-                        // Exception: return leg (faza 1) naviguje cez WP target — vektory speed nenesu, treba explicitnu 178.
-                        if (navState != NavState::CONTOUR_FOLLOW || pixhawkMode == ROVER_MODE_CIRCLE || followReturnLeg == 1) {
+                        // Ensure immediate command only if navigation output is active
+                        if ((navState != NavState::CONTOUR_FOLLOW || pixhawkMode == ROVER_MODE_CIRCLE || followReturnLeg == 1) && !vescNotActive) {
                             if (sendSpeedCommand(spd)) {
                                 lastSentSpeed = spd;
                                 lastSpeedSendMs = millis();
@@ -1760,7 +1762,7 @@ static void handleContourFollowPhase(uint32_t now) {
             float offAmp = atanf(latAmp * 6.2831853f / periodEff) * 57.29577951f;
             if (offAmp > DITHER_MAX_OFF_DEG) offAmp = DITHER_MAX_OFF_DEG;
             ditherPhaseRad += tickDist * 6.2831853f / periodEff;
-            if (ditherPhaseRad >= 6.2831853f) ditherPhaseRad -= 6.2831853f;
+            while (ditherPhaseRad >= 6.2831853f) ditherPhaseRad -= 6.2831853f;
 
             // --- crossing detection: unconditional accumulation, debounced accept ---
             crossSinceLast_m += tickDist;
