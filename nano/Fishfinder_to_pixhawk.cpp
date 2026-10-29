@@ -298,8 +298,7 @@ static float crossSinceLast_m = 0.0f;      // metres since last accepted crossin
 static float excitAccum_m = 0.0f;
 static bool wasBelowTarget = false;
 static uint8_t followReturnLeg = 0;    // 0=vyp, 1=WP leg na circleBest, 2=pivot na circleBestHeading
-static uint8_t pivotNoProgressTicks = 0; // ticky fazy 2 bez zlepsenia dh (fallback po 50 ~ 10 s)
-static float pivotBestDhDeg = 999.0f;    // najlepsia dosiahnuta odchylka headingu v pivote
+tatic uint8_t pivotTicks = 0;           // ticky fazy 2 (timeout po 150 ~ 30 s)
 static bool returnSpeedSent = false;    // 178 v return legu poslana raz, nie kazdy tick
 static float ditherPhaseRad = 0.0f;
 static int32_t prevPosLat_int = 0;
@@ -1000,8 +999,7 @@ static void setCircleAnchor(float lat, int32_t lat_int, int32_t lon_int, float h
     excitAccum_m = 0.0f;
     ditherPhaseRad = 0.0f;
     followReturnLeg = 0;
-    pivotNoProgressTicks = 0;
-    pivotBestDhDeg = 999.0f;
+    pivotTicks = 0;
     returnSpeedSent = false;
 
 #if DEBUG_FREE_RAM
@@ -1640,8 +1638,7 @@ static void handleContourFollowPhase(uint32_t now) {
                 float dEr = (circleBestLon_int - tLon) * METERS_PER_INT7_LAT * activationCosLat;
                 if (dNr * dNr + dEr * dEr <= 1.0f) {
                     followReturnLeg = 2;
-                    pivotNoProgressTicks = 0;
-                    pivotBestDhDeg = 999.0f;
+                    pivotTicks = 0;
                 } else if (pixhawkModeKnown && pixhawkMode == ROVER_MODE_GUIDED) {
                     if (sendPositionTarget(circleBestLat_int, circleBestLon_int)) {
                         if (!returnSpeedSent && !vescNotActive) {
@@ -1660,37 +1657,30 @@ static void handleContourFollowPhase(uint32_t now) {
             }
             if (followReturnLeg == 2) {
                 // Faza 2: pivot na circleBestHeading (isobath smer = spojnica stred->crossing)
-                // Counter rata ticky BEZ NOVEHO BEST dh — nie cas, ale stagnaciu.
-                // Pri 20 deg/s rotacii dh klesa ~4 deg/tick, counter sa resetuje prakticky
-                // kazdy tick. Hranica 1 deg/tick filtruje kompas sum a oscilaciu okolo best.
+                // Jednoduchy timeout 150 tickov (~30 s): rotacia ~20 deg/s pokryje najhorsi
+                // pripad 180° za ~10 s, 30 s strop je pohodlna rezerva na request/response.
+                if (pixhawkModeKnown && pixhawkMode != ROVER_MODE_GUIDED) {
+                    requestModeChange(ROVER_MODE_GUIDED, now);   // len ked treba — nie ked uz sme GUIDED a chyba heading
+                }
                 bool pivotEffective = havePixhawkHeading && pixhawkModeKnown && pixhawkMode == ROVER_MODE_GUIDED;
-                if (!pivotEffective) {
-                    if (pixhawkModeKnown && pixhawkMode != ROVER_MODE_GUIDED) {
-                        requestModeChange(ROVER_MODE_GUIDED, now);
-                    }
-                    pivotNoProgressTicks++;
-                } else {
+                if (pivotEffective) {
                     sendPivotTurn(circleBestHeading);
                     float dh = pixhawkHeadingDeg - circleBestHeading;
                     while (dh > 180.0f) dh -= 360.0f;
                     while (dh < -180.0f) dh += 360.0f;
-                    float absDh = fabsf(dh);
-                    if (absDh <= 15.0f) {
+                    if (fabsf(dh) <= 15.0f) {
                         followReturnLeg = 0;
+                        pivotTicks = 0;
                         prevPosLat_int = slopePrevLat_int = tLat;
                         prevPosLon_int = slopePrevLon_int = tLon;
                         slopePrevDepth = depth_m;
                         slopePrevOffsetDeg = 0.0f;
-                    } else if (absDh < pivotBestDhDeg - 1.0f) {
-                        pivotBestDhDeg = absDh;
-                        pivotNoProgressTicks = 0;   // novy best -> progres
-                    } else {
-                        pivotNoProgressTicks++;     // ziadne zlepsenie (stagnacia alebo sum)
                     }
                 }
-                if (pivotNoProgressTicks > 50) {   // ~10 s bez zlepsenia dh
+                pivotTicks++;
+                if (followReturnLeg == 2 && pivotTicks > 150) {   // timeout; dh-exit vyssie ma prednost
                     followReturnLeg = 0;
-                    sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("CONTOUR: pivot stagn -> follow"));
+                    sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("CONTOUR: pivot timeout -> follow"));
                     prevPosLat_int = slopePrevLat_int = tLat;
                     prevPosLon_int = slopePrevLon_int = tLon;
                     slopePrevDepth = depth_m;
