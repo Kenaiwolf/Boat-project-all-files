@@ -64,10 +64,11 @@ static mavlink_message_t mavMsg;
 // ArduRover mode enumerations
 #define ROVER_MODE_HOLD 4
 #define ROVER_MODE_LOITER 5
+#define ROVER_MODE_CIRCLE 9
 #define ROVER_MODE_GUIDED 15
 
 // Speed limits and adjustment steps in meters per second
-#define MAX_SPEED_MS 3.5f
+#define MAX_SPEED_MS 1.5f
 #define MIN_SPEED_MS 0.1f
 #define SPEED_STEP_MS 0.06f
 #define SPEED_DEADBAND_US 200
@@ -280,11 +281,10 @@ static float circlePrevTheta = 0.0f;
 static int32_t circlePrevLat_int = 0;
 static int32_t circlePrevLon_int = 0;
 static float circleLastDepth = 0.0f;
-static float circleApproachAccumAngle = 0.0f;
-static float circleApproachPrevTheta = 0.0f;
-static bool circleApproachSampled = false;
-static int32_t approachCenterLat_int = 0;
-static int32_t approachCenterLon_int = 0;
+static bool approachWpSent = false;
+static bool circleSpeedPending = false;
+static bool circleThetaSampled = false;
+static uint8_t surveyDriftCount = 0;
 static bool surveyDptWasValid = false;
 static int16_t depthSlopeBufDepth[DEPTH_SLOPE_SAMPLES];
 static int16_t depthSlopeBufDist[DEPTH_SLOPE_SAMPLES];
@@ -817,6 +817,11 @@ static void readMAVLink() {
                 }
                 pixhawkMode = newPixhawkMode;
                 pixhawkModeKnown = true;
+
+                if (circleSpeedPending && newPixhawkMode == ROVER_MODE_CIRCLE && !vescNotActive) {
+                    circleSpeedPending = false;
+                    sendSpeedCommand(fishingSpeed);
+                }
             }
             // Intercepts RC channels to facilitate on-the-fly speed trimming from a radio switch
             if (mavMsg.msgid == MAVLINK_MSG_ID_RC_CHANNELS_RAW) {
@@ -953,18 +958,6 @@ static void setCircleAnchor(float lat, int32_t lat_int, int32_t lon_int, float h
     activationCosLat = cosf(lat * (float)M_PI / 180.0f);
     activationLon_int = lon_int;
     activationPosValid = true;
-
-    // Approximates the center of a tangent circle positioned CONTOUR_CIRCLE_RADIUS_M to the side
-    float approachHeadingDeg = havePixhawkHeading ? pixhawkHeadingDeg
-                            : havePixhawkCog ? pixhawkCogDeg
-                            : headingDeg;
-    float hr = approachHeadingDeg * (float)M_PI / 180.0f;
-    approachCenterLat_int = activationLat_int + (int32_t)((-sinf(hr)) * (CONTOUR_CIRCLE_RADIUS_M * 0.5f) * INT7_PER_METER_LAT);
-    approachCenterLon_int = activationLon_int + (int32_t)((cosf(hr)) * (CONTOUR_CIRCLE_RADIUS_M * 0.5f) * INT7_PER_METER_LAT / activationCosLat);
-
-    circleApproachAccumAngle = 0.0f;
-    circleApproachPrevTheta = 0.0f;
-    circleApproachSampled = false;
     circleCrossFound = false;
     circleBestDev = 999.0f;
     circleAccumAngle = 0.0f;
@@ -1017,7 +1010,11 @@ static void enterContourFollow() {
     contourPhase = ContourPhase::CIRCLE_APPROACH;
     contourTrigger = false;
     navState = NavState::CONTOUR_FOLLOW;
-    sendSpeedCommand(fishingSpeed);
+    approachWpSent = false;
+    circleSpeedPending = false;
+    circleThetaSampled = false;
+    surveyDriftCount = 0;
+    requestModeChange(ROVER_MODE_GUIDED, millis());
 
 #if DEBUG_FREE_RAM
     checkFreeRam('Z');
@@ -1058,8 +1055,12 @@ static void reenterContourFromLastGood() {
         activationPosValid = haveCurrentPos;
     }
 
-    contourPhase = ContourPhase::CIRCLE_SURVEY;
-    sendSpeedCommand(fishingSpeed);
+    contourPhase = ContourPhase::CIRCLE_APPROACH;
+    approachWpSent = false;
+    circleSpeedPending = false;
+    circleThetaSampled = false;
+    surveyDriftCount = 0;
+    requestModeChange(ROVER_MODE_GUIDED, millis());
 
 #if DEBUG_FOLLOW || DEBUG_APPROACH
     sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("CONTOUR: line lost -> re-circle"));
@@ -1307,25 +1308,12 @@ static void handleLoiterWpResetState(uint32_t now, bool rmbFresh) {
 static void handleContourApproachPhase(uint32_t now) {
     if (haveCurrentPos && activationPosValid) {
         float cosLat = activationCosLat;
-        float dN = (currentLat_int - approachCenterLat_int) * METERS_PER_INT7_LAT;
-        float dE = (currentLon_int - approachCenterLon_int) * METERS_PER_INT7_LAT * cosLat;
-        float theta = atan2f(dE, dN) * 57.29577951f;
-        if (theta < 0.0f) theta += 360.0f;
+        float dN = (currentLat_int - activationLat_int) * METERS_PER_INT7_LAT;
+        float dE = (currentLon_int - activationLon_int) * METERS_PER_INT7_LAT * cosLat;
+        float distToCenter = sqrtf(dN * dN + dE * dE);
 
-        if (!circleApproachSampled) {
-            circleApproachPrevTheta = theta;
-            circleApproachAccumAngle = 0.0f;
-            circleApproachSampled = true;
-        } else {
-            float dTheta = theta - circleApproachPrevTheta;
-            while (dTheta > 180.0f) dTheta -= 360.0f;
-            while (dTheta < -180.0f) dTheta += 360.0f;
-            circleApproachAccumAngle += dTheta;
-            circleApproachPrevTheta = theta;
-        }
-
-        // When a semi-circle path is completed, advance logic to full circular survey
-        if (fabsf(circleApproachAccumAngle) >= 180.0f) {
+        if (distToCenter <= 1.5f) {
+            // Na strede aktivacneho bodu -> CIRCLE mode (centruje sa na entry point)
             circlePrevLat_int = currentLat_int;
             circlePrevLon_int = currentLon_int;
             circleAccumAngle = 0.0f;
@@ -1338,8 +1326,11 @@ static void handleContourApproachPhase(uint32_t now) {
             circleLastDepth = haveDPT ? depth_m : contourTargetDepth_m;
             circleMinDepth = circleMaxDepth = circleLastDepth;
             surveyDptWasValid = haveDPT;
-            circleApproachSampled = false;
+            circleThetaSampled = false;
+            surveyDriftCount = 0;
             contourPhase = ContourPhase::CIRCLE_SURVEY;
+            circleSpeedPending = true;
+            requestModeChange(ROVER_MODE_CIRCLE, now);
 #if DEBUG_BREADCRUMB
             EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_SURVEY_ENTER);
 #endif
@@ -1347,13 +1338,20 @@ static void handleContourApproachPhase(uint32_t now) {
             sendStatusText_P(MAV_SEVERITY_INFO, PSTR("CONTOUR: survey phase entered"));
 #endif
         } else {
-            float bearingTangentDeg = theta + 90.0f;
-            if (bearingTangentDeg < 0.0f) bearingTangentDeg += 360.0f;
-            if (bearingTangentDeg >= 360.0f) bearingTangentDeg -= 360.0f;
-            sendVelocityTarget(bearingTangentDeg, fishingSpeed);
+            // WP leg na stred — vyzaduje GUIDED; 178 sa posle raz s targetom
+            if (!pixhawkModeKnown || pixhawkMode != ROVER_MODE_GUIDED) {
+                requestModeChange(ROVER_MODE_GUIDED, now);
+            } else if (!approachWpSent) {
+                if (sendPositionTarget(activationLat_int, activationLon_int)) {
+                    approachWpSent = true;
+                    if (!vescNotActive) sendSpeedCommand(fishingSpeed);
+                }
+            }
         }
     } else {
-        sendVelocityTarget(contourHeadingDeg, haveCurrentPos ? fishingSpeed : 0.0f);
+        if (!pixhawkModeKnown || pixhawkMode != ROVER_MODE_GUIDED) {
+            requestModeChange(ROVER_MODE_GUIDED, now);
+        }
     }
 }
 
@@ -1369,6 +1367,26 @@ static void handleContourSurveyPhase(uint32_t now) {
 
         float theta = atan2f(dE, dN) * 180.0f / (float)M_PI;
         if (theta < 0.0f) theta += 360.0f;
+
+        if (!circleThetaSampled) {
+            circlePrevTheta = theta;
+            circleThetaSampled = true;
+        }
+
+        // Drift guard: CIRCLE drzi CIRC_RADIUS; ujdenie >R+3 m pocas 5 tickov -> re-anchor cez WP
+        if (dist > CONTOUR_CIRCLE_RADIUS_M + 3.0f) {
+            if (++surveyDriftCount >= 5) {
+                surveyDriftCount = 0;
+                contourPhase = ContourPhase::CIRCLE_APPROACH;
+                approachWpSent = false;
+                circleSpeedPending = false;
+                circleThetaSampled = false;
+                requestModeChange(ROVER_MODE_GUIDED, now);
+                return;
+            }
+        } else {
+            surveyDriftCount = 0;
+        }
 
         float dTheta = posIsNew ? (theta - circlePrevTheta) : 0.0f;
         while (dTheta > 180.0f) dTheta -= 360.0f;
@@ -1494,20 +1512,6 @@ static void handleContourSurveyPhase(uint32_t now) {
 
         circlePrevLat_int = currentLat_int;
         circlePrevLon_int = currentLon_int;
-
-        float radErr = dist - CONTOUR_CIRCLE_RADIUS_M;
-        float tangHead = theta + 90.0f;
-        if (tangHead >= 360.0f) tangHead -= 360.0f;
-
-        float radCorr = radErr * CIRCLE_RADIUS_GAIN;
-        if (radCorr > CIRCLE_RADIUS_MAX_CORR_DEG) radCorr = CIRCLE_RADIUS_MAX_CORR_DEG;
-        if (radCorr < -CIRCLE_RADIUS_MAX_CORR_DEG) radCorr = -CIRCLE_RADIUS_MAX_CORR_DEG;
-
-        float corrHead = tangHead + radCorr;
-        while (corrHead < 0.0f) corrHead += 360.0f;
-        while (corrHead >= 360.0f) corrHead -= 360.0f;
-        sendVelocityTarget(corrHead, fishingSpeed);
-
         // When a full circle is completed, analyze data and enter follow phase
         if (circleAccumAngle >= 360.0f || circleAccumAngle <= -360.0f) {
             if (circleCrossFound) {
@@ -1561,7 +1565,7 @@ static void handleContourSurveyPhase(uint32_t now) {
 #if DEBUG_BREADCRUMB
                 EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_FOLLOW_ENTER);
 #endif
-                sendSpeedCommand(fishingSpeed);
+                requestModeChange(ROVER_MODE_GUIDED, now);
 #if DEBUG_SURVEY || DEBUG_FOLLOW
                 sendStatusText_P(MAV_SEVERITY_INFO, PSTR("CONTOUR: survey done -> follow"));
 #endif
@@ -1587,7 +1591,9 @@ static void handleContourSurveyPhase(uint32_t now) {
             }
         }
     } else {
-        sendVelocityTarget(contourHeadingDeg, haveCurrentPos ? fishingSpeed : 0.0f);
+        if (!pixhawkModeKnown || pixhawkMode != ROVER_MODE_CIRCLE) {
+            requestModeChange(ROVER_MODE_CIRCLE, now);
+        }
     }
 }
 
@@ -1614,7 +1620,8 @@ static void handleContourFollowPhase(uint32_t now) {
                     prevPosLon_int = slopePrevLon_int = tLon;
                     slopePrevDepth = depth_m;
                     slopePrevOffsetDeg = 0.0f;
-                    sendVelocityTarget(contourHeadingDeg, fishingSpeed);
+                    if (pixhawkModeKnown && pixhawkMode == ROVER_MODE_GUIDED)
+                        sendVelocityTarget(contourHeadingDeg, fishingSpeed);
                     return;
                 }
             }
@@ -1720,7 +1727,6 @@ static void handleContourFollowPhase(uint32_t now) {
                 EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_FOLLOW_REENTER);
 #endif
                 reenterContourFromLastGood();
-                sendVelocityTarget(contourHeadingDeg, fishingSpeed);
                 return;
             }
 
@@ -1748,7 +1754,8 @@ static void handleContourFollowPhase(uint32_t now) {
 #if DEBUG_BREADCRUMB
         EEPROM.update(EEPROM_ADDR_BREADCRUMB, BC_FOLLOW_SEND_DONE);
 #endif
-        sendVelocityTarget(contourHeadingDeg, haveCurrentPos ? fishingSpeed : 0.0f);
+        if (pixhawkModeKnown && pixhawkMode == ROVER_MODE_GUIDED)
+            sendVelocityTarget(contourHeadingDeg, haveCurrentPos ? fishingSpeed : 0.0f);
     }
 }
 
@@ -1773,7 +1780,10 @@ static void handleContourFollowState(uint32_t now, bool rmbFresh) {
         }
     } else if (pixhawkMode == ROVER_MODE_HOLD) {
         // Guard: Maintain HOLD mode without falling through to GUIDED or depthLost actions
-    } else if (pixhawkMode != ROVER_MODE_GUIDED) {
+    } else if (pixhawkMode != ROVER_MODE_GUIDED &&
+               !(pixhawkMode == ROVER_MODE_CIRCLE &&
+                 (contourPhase != ContourPhase::FOLLOW ||
+                  pendingMode == (int16_t)ROVER_MODE_GUIDED))) {
         static bool extModeWarned = false;
         if (!extModeWarned) {
             extModeWarned = true;
@@ -1873,7 +1883,7 @@ void loop() {
         // Unified sonar safety: shallow water OR lost depth => loiter reset.
         // Only when Pixhawk is in GUIDED (MANUAL/RC, HOLD, LOITER reset = skip).
         // Bez DPT sa nenaviguje: chybajuca hlbka alebo plytka voda => reset.
-        if (pixhawkModeKnown && pixhawkMode == ROVER_MODE_GUIDED && !holdLatched) {
+        if (pixhawkModeKnown && (pixhawkMode == ROVER_MODE_GUIDED || pixhawkMode == ROVER_MODE_CIRCLE) && !holdLatched) {
             if (!haveDPT || depth_m < CONTOUR_SAFETY_DEPTH_M) {
                 gotoLoiterReset(BC_SONAR_FAIL);
                 sendStatusText_P(MAV_SEVERITY_WARNING, PSTR("SONAR: shallow/lost -> LOITER"));
