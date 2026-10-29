@@ -1282,7 +1282,9 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
             enterContourFollow();
         } else if (pixhawkMode == ROVER_MODE_HOLD) {
             // Guard: Intentionally do nothing to prevent LOITER reset while in HOLD mode
-        } else {
+        else if (!rmbArrived)
+        {
+            // Store resume identity and initiate loiter-based flush
             strncpy(lastLoiterResetDestId, prevDestWpId, sizeof(lastLoiterResetDestId) - 1);
             lastLoiterResetDestId[sizeof(lastLoiterResetDestId) - 1] = '\0';
             gotoLoiterReset(BC_LOITER_WP_RESET_RMB);
