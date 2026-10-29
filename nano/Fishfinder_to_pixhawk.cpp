@@ -299,7 +299,9 @@ static float circleMaxDepth = 0.0f;
 static float crossSinceLast_m = 0.0f;      // metres since last accepted crossing (debounce + lost)
 static float excitAccum_m = 0.0f;
 static bool wasBelowTarget = false;
-static bool followReturnLeg = false;   // true = navrat na circleBest bod pred tangent follow
+static uint8_t followReturnLeg = 0;    // 0=vyp, 1=WP leg na circleBest, 2=pivot na circleBestHeading
+static uint8_t pivotNoHeadingTicks = 0; // ticky fazy 2 bez efektivneho pivota (fallback po 30)
+static bool returnSpeedSent = false;    // 178 v return legu poslana raz, nie kazdy tick
 static float ditherPhaseRad = 0.0f;
 static int32_t prevPosLat_int = 0;
 static int32_t prevPosLon_int = 0;
@@ -753,6 +755,25 @@ static void sendVelocityTarget(float headingDeg, float speed_ms) {
     mavSend(20);
 }
 
+// Commands a yaw-only pivot turn: vel/accel ignored, yaw active -> fork hits
+// vel_ignore && !yaw_ignore && yaw_rate_ignore -> set_desired_heading_and_speed(yaw, 0)
+static void sendPivotTurn(float headingDeg) {
+    if (!pixhawkModeKnown || pixhawkMode != ROVER_MODE_GUIDED) return;
+    while (headingDeg < 0.0f) headingDeg += 360.0f;
+    while (headingDeg >= 360.0f) headingDeg -= 360.0f;
+    mavlink_set_position_target_global_int_t sp = {};
+    sp.time_boot_ms = (uint32_t)millis();
+    sp.target_system = TARGET_SYS;
+    sp.target_component = TARGET_COMP;
+    sp.coordinate_frame = COORD_FRAME;
+    // Ignore pos (0,1,2), vel (3,4), vz (5), accel (6,7,8), yaw_rate (11) — yaw (bit 10) active
+    sp.type_mask = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) |
+                   (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 11);
+    sp.yaw = headingDeg * 0.01745329251f;
+    mavlink_msg_set_position_target_global_int_encode(SYS_ID, COMP_ID, &mavMsgTx, &sp);
+    mavSend(20);
+}
+
 // Transmits a DO_CHANGE_SPEED MAVLink command
 static bool sendSpeedCommand(float speed_ms) {
     mavlink_msg_command_long_pack(SYS_ID, COMP_ID, &mavMsgTx, TARGET_SYS, TARGET_COMP, MAV_CMD_DO_CHANGE_SPEED, 0, 1, speed_ms, -1, 0, 0, 0, 0);
@@ -840,9 +861,9 @@ static void readMAVLink() {
 
                 if (trimState != prevTrimState) {
                     prevTrimState = trimState;
-                    if (trimState != 0 &&  
-                        (pixhawkMode == ROVER_MODE_GUIDED || pixhawkMode == ROVER_MODE_CIRCLE) &&  
-                        ((navState == NavState::GUIDED && rmbActive && (millis() - lastRMBms) < RMB_TIMEOUT_MS) || navState == NavState::CONTOUR_FOLLOW)) {  
+                    if (trimState != 0 &&
+                        (pixhawkMode == ROVER_MODE_GUIDED || pixhawkMode == ROVER_MODE_CIRCLE) &&
+                        ((navState == NavState::GUIDED && rmbActive && (millis() - lastRMBms) < RMB_TIMEOUT_MS) || navState == NavState::CONTOUR_FOLLOW)) {
 
                         float &spd = (navState == NavState::GUIDED && !routeIsMultiWP) ? travelSpeed : fishingSpeed;
                         if (trimState == 1) {
@@ -977,7 +998,9 @@ static void setCircleAnchor(float lat, int32_t lat_int, int32_t lon_int, float h
     crossSinceLast_m = 0.0f;
     excitAccum_m = 0.0f;
     ditherPhaseRad = 0.0f;
-    followReturnLeg = false;
+    followReturnLeg = 0;
+    pivotNoHeadingTicks = 0;
+    returnSpeedSent = false;
 
 #if DEBUG_FREE_RAM
     checkFreeRam('G');
@@ -1249,7 +1272,7 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
                 }
             }
         }
-    } else if (!waypointReset && rmbEverActive &&  
+    } else if (!waypointReset && rmbEverActive &&
                pixhawkModeKnown && pixhawkMode == ROVER_MODE_GUIDED) {
         if (contourTrigger && haveDPT && haveCurrentPos &&
             haveLastLegHeading && (havePixhawkHeading || havePixhawkCog) &&
@@ -1543,13 +1566,10 @@ static void handleContourSurveyPhase(uint32_t now) {
                 excitAccum_m = 0.0f;
                 ditherPhaseRad = 0.0f;
                 wasBelowTarget = (depth_m > contourTargetDepth_m);
-                // Return leg: ak sa lod vzdialila od vybrateho crossing bodu (>1.5 m),
-                // najprv sa vrat nan — inak tangent kurz vytvori paralelnu drahu
-                {
-                    float dRb = (circleBestLat_int - tLat) * METERS_PER_INT7_LAT;
-                    float dEb = (circleBestLon_int - tLon) * METERS_PER_INT7_LAT * activationCosLat;
-                    followReturnLeg = (dRb * dRb + dEb * dEb > 2.25f);
-                }
+                // Return leg: vzdy navrat na crossing + pivot na circleBestHeading —
+                // vzdialenost nerozhoduje, rozhoduje kurz prichodu cez crossing
+                followReturnLeg = 1;
+                returnSpeedSent = false;
 
                 contourLastGoodLat_int = tLat;
                 contourLastGoodLon_int = tLon;
@@ -1610,23 +1630,60 @@ static void handleContourFollowPhase(uint32_t now) {
             int32_t tLat, tLon;
             transducerPos(currentLat_int, currentLon_int, tLat, tLon);
 
-            if (followReturnLeg) {
+            if (followReturnLeg == 1) {
+                // Faza 1: WP leg na circleBest (crossing) — bezpodmienecne
                 float dNr = (circleBestLat_int - tLat) * METERS_PER_INT7_LAT;
                 float dEr = (circleBestLon_int - tLon) * METERS_PER_INT7_LAT * activationCosLat;
                 if (dNr * dNr + dEr * dEr <= 1.0f) {
-                    followReturnLeg = false;   // sme na crossing bode -> normalny follow
-                } else {
-                    if (pixhawkModeKnown && pixhawkMode == ROVER_MODE_GUIDED) {
-                if (!vescNotActive) sendSpeedCommand(fishingSpeed);
-                if (sendPositionTarget(circleBestLat_int, circleBestLon_int)) {
-                            prevPosLat_int = slopePrevLat_int = tLat;
-                            prevPosLon_int = slopePrevLon_int = tLon;
-                            slopePrevDepth = depth_m;
-                            slopePrevOffsetDeg = 0.0f;
+                    followReturnLeg = 2;
+                    pivotNoHeadingTicks = 0;
+                } else if (pixhawkModeKnown && pixhawkMode == ROVER_MODE_GUIDED) {
+                    if (sendPositionTarget(circleBestLat_int, circleBestLon_int)) {
+                        if (!returnSpeedSent && !vescNotActive) {
+                            sendSpeedCommand(fishingSpeed);
+                            returnSpeedSent = true;
                         }
+                        prevPosLat_int = slopePrevLat_int = tLat;
+                        prevPosLon_int = slopePrevLon_int = tLon;
+                        slopePrevDepth = depth_m;
+                        slopePrevOffsetDeg = 0.0f;
                     }
-                    return;
+                } else {
+                    requestModeChange(ROVER_MODE_GUIDED, now);
                 }
+                return;
+            }
+            if (followReturnLeg == 2) {
+                // Faza 2: pivot na circleBestHeading (isobath smer = spojnica stred->crossing)
+                // Counter rata ticky bez efektivneho pivota (nielen bez heading,
+                // aj ked mod nie je GUIDED a sendPivotTurn no-opuje) — inak visiaci stav
+                if (!havePixhawkHeading || (pixhawkModeKnown && pixhawkMode != ROVER_MODE_GUIDED)) {
+                    if (pixhawkModeKnown && pixhawkMode != ROVER_MODE_GUIDED) {
+                        requestModeChange(ROVER_MODE_GUIDED, now);
+                    }
+                    pivotNoHeadingTicks++;
+                    if (pivotNoHeadingTicks > 30) {   // ~6 s pri 200 ms ticku
+                        followReturnLeg = 0;
+                        prevPosLat_int = slopePrevLat_int = tLat;
+                        prevPosLon_int = slopePrevLon_int = tLon;
+                        slopePrevDepth = depth_m;
+                        slopePrevOffsetDeg = 0.0f;
+                    }
+                } else {
+                    pivotNoHeadingTicks = 0;
+                    sendPivotTurn(circleBestHeading);
+                    float dh = pixhawkHeadingDeg - circleBestHeading;
+                    while (dh > 180.0f) dh -= 360.0f;
+                    while (dh < -180.0f) dh += 360.0f;
+                    if (fabsf(dh) <= 15.0f) {
+                        followReturnLeg = 0;
+                        prevPosLat_int = slopePrevLat_int = tLat;
+                        prevPosLon_int = slopePrevLon_int = tLon;
+                        slopePrevDepth = depth_m;
+                        slopePrevOffsetDeg = 0.0f;
+                    }
+                }
+                return;
             }
 
             // --- per-tick distance (transducer frame) ---
