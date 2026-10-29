@@ -840,8 +840,9 @@ static void readMAVLink() {
 
                 if (trimState != prevTrimState) {
                     prevTrimState = trimState;
-                    if (trimState != 0 &&
-                        ((navState == NavState::GUIDED && rmbActive && (millis() - lastRMBms) < RMB_TIMEOUT_MS) || navState == NavState::CONTOUR_FOLLOW)) {
+                    if (trimState != 0 &&  
+                        (pixhawkMode == ROVER_MODE_GUIDED || pixhawkMode == ROVER_MODE_CIRCLE) &&  
+                        ((navState == NavState::GUIDED && rmbActive && (millis() - lastRMBms) < RMB_TIMEOUT_MS) || navState == NavState::CONTOUR_FOLLOW)) {  
 
                         float &spd = (navState == NavState::GUIDED && !routeIsMultiWP) ? travelSpeed : fishingSpeed;
                         if (trimState == 1) {
@@ -865,7 +866,7 @@ static void readMAVLink() {
                         }
 #endif
                         // Send speed immediately if not actively following contour logic which updates continuously
-                        if (navState != NavState::CONTOUR_FOLLOW) {
+                        if (navState != NavState::CONTOUR_FOLLOW || pixhawkMode == ROVER_MODE_CIRCLE) {
                             if (sendSpeedCommand(spd)) {
                                 lastSentSpeed = spd;
                                 lastSpeedSendMs = millis();
@@ -1248,7 +1249,8 @@ static void handleGuidedState(uint32_t now, bool rmbFresh) {
                 }
             }
         }
-    } else if (!waypointReset && rmbEverActive) {
+    } else if (!waypointReset && rmbEverActive &&  
+               pixhawkModeKnown && pixhawkMode == ROVER_MODE_GUIDED) {
         if (contourTrigger && haveDPT && haveCurrentPos &&
             haveLastLegHeading && (havePixhawkHeading || havePixhawkCog) &&
             rmbArrived) {
@@ -1615,7 +1617,8 @@ static void handleContourFollowPhase(uint32_t now) {
                     followReturnLeg = false;   // sme na crossing bode -> normalny follow
                 } else {
                     if (pixhawkModeKnown && pixhawkMode == ROVER_MODE_GUIDED) {
-                        if (sendPositionTarget(circleBestLat_int, circleBestLon_int)) {
+                if (!vescNotActive) sendSpeedCommand(fishingSpeed);
+                if (sendPositionTarget(circleBestLat_int, circleBestLon_int)) {
                             prevPosLat_int = slopePrevLat_int = tLat;
                             prevPosLon_int = slopePrevLon_int = tLon;
                             slopePrevDepth = depth_m;
